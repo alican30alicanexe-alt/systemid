@@ -57,10 +57,10 @@ import numpy as np
 
 CADAC_REPO = "https://github.com/missiondesignsolutions/CADAC.git"
 
-#: CADAC sources committed alongside this file, so generation needs no network.
-#: See ``cadac/NOTICE.md`` for provenance, licence and the diff-check against
+#: CADAC checkout committed alongside this file, so generation needs no network.
+#: See ``CADAC_NOTICE.md`` for provenance, licence and the diff-check against
 #: upstream. Used automatically when present; upstream is cloned otherwise.
-VENDORED_CADAC = Path(__file__).resolve().parent / "cadac"
+VENDORED_CADAC = Path(__file__).resolve().parent / "CADAC"
 
 #: ``(file, variable, output-field-after-patch)``. The final ``init()`` argument is
 #: the output field; ``plot`` routes the variable into ``plot1.asc``.
@@ -217,9 +217,9 @@ def fetch_source(cfg: GeneratorConfig, force: bool = False) -> Path:
     if cfg.cadac_source is not None:
         source = _find_rocket6g(Path(cfg.cadac_source).expanduser())
         print(f"[fetch] source {source}")
-    elif (VENDORED_CADAC / "ROCKET6G" / "newton.cpp").is_file():
-        source = VENDORED_CADAC / "ROCKET6G"
-        print(f"[fetch] vendored source {source}")
+    elif VENDORED_CADAC.is_dir():
+        source = _find_rocket6g(VENDORED_CADAC)
+        print(f"[fetch] bundled source {source}")
     else:
         clone = cfg.work_dir / "_cadac_clone"
         if not clone.exists():

@@ -1,0 +1,222 @@
+///////////////////////////////////////////////////////////////////////////////
+// COMPONENT: rcs_simple
+// CATEGORY: Actuators
+// DoF: 6DoF
+//
+// DESCRIPTION:
+//   Reaction Control System (RCS) for attitude control
+//   Proportional thrusters for roll, pitch, and yaw moments
+//   Use for: Spacecraft, exo-atmospheric vehicles, upper stages
+//
+// INPUTS (from vehicle array):
+//   vehicle[0] - time - double - Simulation time sec
+//   vehicle[18] - IBBB - Matrix(3x3) - Inertia tensor kg·m²
+//   vehicle[320] - ppcx - double - Roll rate deg/s
+//   vehicle[321] - qqcx - double - Pitch rate deg/s
+//   vehicle[322] - rrcx - double - Yaw rate deg/s
+//   vehicle[338] - phibdcx - double - Roll angle deg
+//   vehicle[339] - thtbdcx - double - Pitch angle deg
+//   vehicle[340] - psibdcx - double - Yaw angle deg
+//
+// OUTPUTS (to vehicle array):
+//   vehicle[64] - FMRCS - Matrix(3x1) - RCS moments N·m
+//   vehicle[84] - FARCS - Matrix(3x1) - RCS forces N (optional)
+//
+// PARAMETERS (from input.asc):
+//   vehicle[50] - mrcs_moment - int - RCS moment mode (=|type||mode|)
+//   vehicle[51] - mrcs_force - int - RCS force mode (0=off, 1=prop)
+//   vehicle[55] - roll_mom_max - double - Max roll moment N·m
+//   vehicle[56] - pitch_mom_max - double - Max pitch moment N·m
+//   vehicle[57] - yaw_mom_max - double - Max yaw moment N·m
+//   vehicle[58] - rcs_zeta - double - RCS damping
+//   vehicle[59] - rcs_freq - double - RCS natural frequency rad/s
+//   vehicle[70] - phibdcomx - double - Roll angle command deg
+//   vehicle[71] - thtbdcomx - double - Pitch angle command deg
+//   vehicle[72] - psibdcomx - double - Yaw angle command deg
+//
+// DEPENDENCIES:
+//   - Requires: Kinematics module for angles and rates
+//   - Requires: Propulsion module for inertia tensor (IBBB)
+//   - Provides: FMRCS moments for forces module
+//
+// REFERENCE:
+//   Zipfel, "Modeling and Simulation of Aerospace Vehicle Dynamics", 2nd ed.
+//   Chapter 15: Reaction Control Systems
+//
+//   Proportional RCS control law:
+//     M = K_p * (angle_cmd - angle) - K_d * (rate)
+//
+//   where:
+//     K_p = ω_n² * I / (2*ζ*ω_n)  (proportional gain)
+//     K_d = 2*ζ*ω_n * I            (rate gain)
+//
+//   Moment saturation:
+//     M = min(|M|, M_max) * sign(M)
+//
+// USAGE:
+//   Include in class header:
+//     virtual void def_rcs();
+//     virtual void rcs();
+//
+//   In input.asc MODULES section:
+//     rcs   def,exec
+//
+//   In input.asc DATA section:
+//     mrcs_moment = 11       // Proportional, Euler angle mode
+//     roll_mom_max = 100     // Max roll moment, N·m
+//     pitch_mom_max = 500    // Max pitch moment, N·m
+//     yaw_mom_max = 500      // Max yaw moment, N·m
+//     rcs_zeta = 0.7         // RCS damping
+//     rcs_freq = 1.0         // RCS bandwidth, rad/s
+//     phibdcomx = 0          // Roll command, deg
+//     thtbdcomx = 0          // Pitch command, deg
+//     psibdcomx = 0          // Yaw command, deg
+//
+// NOTES:
+//   - mrcs_moment flag: type (tens digit), mode (units digit)
+//     * Type: 0=off, 1=proportional, 2=on-off (Schmitt)
+//     * Mode: 0=none, 1=Euler angles, 2=thrust vector, 3=incidence
+//   - RCS effective in vacuum (no aerodynamics)
+//   - Proportional thrusters: continuous modulation
+//   - On-off thrusters: bang-bang control (not implemented here)
+//   - Moment arms typically small (0.5-2 m from CG)
+//   - Typical RCS bandwidth: 0.1-2 rad/s (slow compared to aero)
+//   - Thruster clusters: usually 4-12 thrusters total
+//   - Each thruster: 10-1000 N thrust
+//   - Fuel: hydrazine, cold gas, or ion propellant
+//   - Duty cycle: minimize fuel consumption
+//   - Inertia coupling important for asymmetric vehicles
+//   - Roll control always active (mode independent)
+//   - Pitch/yaw control depends on mode selection
+///////////////////////////////////////////////////////////////////////////////
+
+#include "class_hierarchy.hpp"
+
+///////////////////////////////////////////////////////////////////////////////
+//Definition of RCS module-variables
+//Member function of class 'Vehicle'
+///////////////////////////////////////////////////////////////////////////////
+void Vehicle::def_rcs()
+{
+	//Definition and initialization of module-variables
+	vehicle[50].init("mrcs_moment","int",0,"Attitude control, =|rcs_type||rcs_mode|, see table","rcs","data","");
+	vehicle[51].init("mrcs_force","int",0,"Side force control =0: none; =1:prop.; =2:Schmitt","rcs","data","");
+	vehicle[55].init("roll_mom_max",0,"RCS rolling moment max value - Nm","rcs","data","");
+	vehicle[56].init("pitch_mom_max",0,"RCS pitching moment max value - Nm","rcs","data","");
+	vehicle[57].init("yaw_mom_max",0,"RCS yawing moment max value - Nm","rcs","data","");
+	vehicle[58].init("rcs_zeta",0,"Damping of closed-loop rop RCS - ND","rcs","data","");
+	vehicle[59].init("rcs_freq",0,"Natural freq. of closed-loop prop RCS - rad/s","rcs","data","");
+	vehicle[64].init("FMRCS",0,0,0,"Moment generated by the RCS thrusters - Nm","rcs","out","");
+	vehicle[70].init("phibdcomx",0,"Roll angle command - deg","rcs","data","");
+	vehicle[71].init("thtbdcomx",0,"Pitch angle command - deg","rcs","data","");
+	vehicle[72].init("psibdcomx",0,"Yaw angle command - deg","rcs","data","");
+	vehicle[84].init("FARCS",0,0,0,"Force generated by the RCS side thrusters - N","rcs","out","");
+}
+
+///////////////////////////////////////////////////////////////////////////////
+//RCS module
+//Member function of class 'Vehicle'
+//
+// Proportional RCS thrusters for attitude control
+//
+// 040302 Created by Peter Zipfel
+// xxxxxx Adapted to component library (simplified to proportional only)
+///////////////////////////////////////////////////////////////////////////////
+void Vehicle::rcs()
+{
+	//local variables
+	double e_roll(0);
+	double e_pitch(0);
+	double e_yaw(0);
+
+	//local module-variables
+	Matrix FMRCS(3,1);
+	Matrix FARCS(3,1);
+
+	//localizing module-variables
+	//input data
+	int mrcs_moment=vehicle[50].integer();
+	int mrcs_force=vehicle[51].integer();
+	double roll_mom_max=vehicle[55].real();
+	double pitch_mom_max=vehicle[56].real();
+	double yaw_mom_max=vehicle[57].real();
+	double rcs_zeta=vehicle[58].real();
+	double rcs_freq=vehicle[59].real();
+	double phibdcomx=vehicle[70].real();
+	double thtbdcomx=vehicle[71].real();
+	double psibdcomx=vehicle[72].real();
+	//input from other modules
+	double time=vehicle[0].real();
+	Matrix IBBB=vehicle[18].mat();
+	double ppcx=vehicle[320].real();   // Body rates
+	double qqcx=vehicle[321].real();
+	double rrcx=vehicle[322].real();
+	double phibdcx=vehicle[338].real();  // Euler angles
+	double thtbdcx=vehicle[339].real();
+	double psibdcx=vehicle[340].real();
+	//----------------------------------------------------------------------------
+	//**DECODE RCS FLAG**
+	// mrcs_moment = |rcs_type||rcs_mode|
+	int rcs_type = mrcs_moment / 10;   // Tens digit: thruster type
+	int rcs_mode = mrcs_moment % 10;   // Units digit: control mode
+
+	//**PROPORTIONAL MOMENT THRUSTERS**
+	if(rcs_type == 1) {
+
+		//**CALCULATE GAINS** (based on desired closed-loop dynamics)
+		// PD control: M = K_p*(θ_cmd - θ) - K_d*ω
+		double rgain_roll = 2 * rcs_zeta * rcs_freq * IBBB.get_loc(0,0);
+		double rgain_pitch = 2 * rcs_zeta * rcs_freq * IBBB.get_loc(1,1);
+		double rgain_yaw = 2 * rcs_zeta * rcs_freq * IBBB.get_loc(2,2);
+		double pgain = rcs_freq / (2 * rcs_zeta);
+
+		//**ROLL CONTROL** (always active)
+		// e = K_d * (K_p/K_d * (cmd - actual) - rate)
+		e_roll = rgain_roll * (pgain * (phibdcomx - phibdcx) - ppcx);
+		FMRCS[0] = rcs_prop(e_roll, roll_mom_max);
+
+		//**PITCH AND YAW CONTROL** (mode dependent)
+		//
+		// Mode 1: Geodetic Euler angle control
+		if(rcs_mode == 1) {
+			e_pitch = rgain_pitch * (pgain * (thtbdcomx - thtbdcx) - qqcx);
+			e_yaw = rgain_yaw * (pgain * (psibdcomx - psibdcx) - rrcx);
+		}
+
+		// Generate moments (saturate to max)
+		FMRCS[1] = rcs_prop(e_pitch, pitch_mom_max);
+		FMRCS[2] = rcs_prop(e_yaw, yaw_mom_max);
+	}
+
+	//**NO RCS**
+	if(rcs_type == 0) {
+		FMRCS.zero();
+		FARCS.zero();
+	}
+	//----------------------------------------------------------------------------
+	//loading module-variables
+	//output to other modules
+	vehicle[64].gets_vec(FMRCS);  // To forces module
+	vehicle[84].gets_vec(FARCS);  // To forces module (optional)
+}
+
+///////////////////////////////////////////////////////////////////////////////
+//Proportional RCS thruster with saturation
+//Member function of class 'Vehicle'
+//
+// Saturates thruster moment to maximum available
+//
+// 040302 Created by Peter Zipfel
+// xxxxxx Adapted to component library
+///////////////////////////////////////////////////////////////////////////////
+double Vehicle::rcs_prop(double error, double mom_max)
+{
+	//Proportional control with saturation
+	double moment = error;
+
+	// Saturate to maximum moment
+	if(fabs(moment) > mom_max)
+		moment = mom_max * sign(moment);
+
+	return moment;
+}
