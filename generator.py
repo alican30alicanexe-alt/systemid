@@ -43,10 +43,12 @@ data. All three are verified against the upstream ROCKET6G sources:
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator, Sequence
@@ -85,11 +87,14 @@ COMPILE_CMD: tuple[str, ...] = (
 #: to a single ``plot1.asc`` under one banner, so this is the only run delimiter.
 RUN_DELIMITER_TIME = -1.0
 
+#: Trajectory Dynamics only -- the scoped first subsystem. Attitude is carried in
+#: the parameter vector rather than the state: the rotational subsystem is out of
+#: scope, and the Euler-rate kinematics are singular at theta = 90 deg, which is
+#: exactly the launch attitude (``thtbdx`` starts at 90). Adding the rotational
+#: states (WBIB) later is purely additive.
 DEFAULT_STATE: tuple[str, ...] = (
-    "SBII1", "SBII2", "SBII3",     # inertial position    - m
-    "VBII1", "VBII2", "VBII3",     # inertial velocity    - m/s
-    "phibdx", "thtbdx", "psibdx",  # Euler angles         - deg
-    "WBIB1", "WBIB2", "WBIB3",     # body angular rate    - rad/s
+    "SBII1", "SBII2", "SBII3",  # inertial position - m
+    "VBII1", "VBII2", "VBII3",  # inertial velocity - m/s
 )
 
 DEFAULT_PARAMS: tuple[str, ...] = (
@@ -102,6 +107,11 @@ DEFAULT_PARAMS: tuple[str, ...] = (
     "alt",      # altitude                - m
     "alphax",   # angle of attack         - deg
     "betax",    # sideslip angle          - deg
+    # Attitude and geodetic position: needed to rotate body-frame thrust into the
+    # inertial frame (TBI = TBD(euler) * TDI(lon, lat, time)). physics.py reads all
+    # five out of p in body_to_inertial(); omitting them raises KeyError there.
+    "phibdx", "thtbdx", "psibdx",  # Euler angles, body wrt geodetic - deg
+    "lonx", "latx",                # geodetic longitude / latitude   - deg
 )
 
 #: Truth columns for validating finite differences, as ``state -> CADAC's own
@@ -128,6 +138,10 @@ class GeneratorConfig:
     work_dir: Path = Path("cadac_work")
     out_path: Path = Path("data/rocket6g.npz")
     source: str = "input_insertion.asc"
+
+    #: Local CADAC checkout to copy ROCKET6G from. ``None`` clones upstream, which
+    #: stays the default -- see :func:`fetch_source` for why a local copy is opt-in.
+    cadac_source: Path | None = None
 
     n_runs: int = 200
     seed: int = 1234
@@ -163,8 +177,30 @@ class GeneratorConfig:
 # 1-3. source, patch, build
 # --------------------------------------------------------------------------- #
 
+def _find_rocket6g(root: Path) -> Path:
+    """Locate the ROCKET6G source directory inside a CADAC checkout.
+
+    Upstream keeps the examples at the top level; the pyCAS packaging keeps them
+    under ``example/``. Both are accepted so a local checkout works either way.
+    """
+    for candidate in (root, root / "ROCKET6G", root / "example" / "ROCKET6G"):
+        if (candidate / "newton.cpp").is_file():
+            return candidate
+    raise RuntimeError(
+        f"no ROCKET6G under {root} (looked for newton.cpp in ./, ROCKET6G/, "
+        "example/ROCKET6G/)"
+    )
+
+
 def fetch_source(cfg: GeneratorConfig, force: bool = False) -> Path:
-    """Clone ROCKET6G into ``cfg.src_dir``. Idempotent unless ``force``."""
+    """Populate ``cfg.src_dir`` with ROCKET6G. Idempotent unless ``force``.
+
+    Uses ``cfg.cadac_source`` when set -- a local CADAC checkout, no network. That
+    is not the default: every measured number in this framework came from the
+    upstream repo, and a local checkout may be an edited copy (pyCAS ships a
+    cleaned ROCKET6G whose MSVC declarations are already fixed). Diff-check a
+    local source against upstream before relying on it.
+    """
     if cfg.src_dir.exists() and not force:
         print(f"[fetch] reusing {cfg.src_dir}")
         return cfg.src_dir
@@ -172,14 +208,20 @@ def fetch_source(cfg: GeneratorConfig, force: bool = False) -> Path:
         shutil.rmtree(cfg.src_dir)
 
     cfg.work_dir.mkdir(parents=True, exist_ok=True)
-    clone = cfg.work_dir / "_cadac_clone"
-    if not clone.exists():
-        print(f"[fetch] cloning {CADAC_REPO}")
-        subprocess.run(
-            ["git", "clone", "--depth", "1", CADAC_REPO, str(clone)],
-            check=True, capture_output=True, text=True,
-        )
-    shutil.copytree(clone / "ROCKET6G", cfg.src_dir)
+    if cfg.cadac_source is not None:
+        source = _find_rocket6g(Path(cfg.cadac_source).expanduser())
+        print(f"[fetch] local source {source}")
+    else:
+        clone = cfg.work_dir / "_cadac_clone"
+        if not clone.exists():
+            print(f"[fetch] cloning {CADAC_REPO}")
+            subprocess.run(
+                ["git", "clone", "--depth", "1", CADAC_REPO, str(clone)],
+                check=True, capture_output=True, text=True,
+            )
+        source = _find_rocket6g(clone)
+
+    shutil.copytree(source, cfg.src_dir)
     print(f"[fetch] ROCKET6G -> {cfg.src_dir}")
     return cfg.src_dir
 
@@ -234,10 +276,26 @@ def patch_source(cfg: GeneratorConfig) -> None:
 
 
 def build(cfg: GeneratorConfig) -> Path:
-    """Compile ROCKET6G. Returns the executable path."""
+    """Compile ROCKET6G. Returns the executable path.
+
+    Prefers a bundled ``Makefile`` when one exists -- some CADAC packagings ship
+    one, and it already carries the right flags for that copy. Upstream has no
+    Makefile and needs ``COMPILE_CMD``'s workarounds, so that is the fallback.
+    """
     sources = sorted(p.name for p in cfg.src_dir.glob("*.cpp"))
     if not sources:
         raise RuntimeError(f"no .cpp sources in {cfg.src_dir}")
+
+    if (cfg.src_dir / "Makefile").is_file():
+        print("[build] make (bundled Makefile) ...")
+        result = subprocess.run(
+            ["make", "-j", str(os.cpu_count() or 1)], cwd=cfg.src_dir,
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0 and cfg.exe.exists():
+            print(f"[build] -> {cfg.exe}")
+            return cfg.exe
+        print("[build] make failed, falling back to explicit g++")
 
     print(f"[build] g++ on {len(sources)} sources ...")
     result = subprocess.run(
@@ -497,13 +555,148 @@ def save(dataset: dict[str, np.ndarray], cfg: GeneratorConfig) -> Path:
 
 
 def generate(cfg: GeneratorConfig, force_rebuild: bool = False) -> Path:
-    """Run the full pipeline end to end."""
+    """Run the full pipeline end to end in a single batch."""
+    prepare(cfg, force_rebuild=force_rebuild)
+    write_input(cfg)
+    return save(build_dataset(cfg, run(cfg)), cfg)
+
+
+# --------------------------------------------------------------------------- #
+# chunked generation
+# --------------------------------------------------------------------------- #
+
+#: Arrays concatenated when merging chunks. Everything else in a chunk file is
+#: metadata that must agree rather than accumulate.
+_STACKED = ("x", "p", "xdot", "t", "run_id")
+
+#: Seed stride between chunks. Wide enough that no two chunks can draw overlapping
+#: dispersion sequences, and stable so a chunk's seed never depends on how many
+#: chunks were requested -- that is what makes extending a campaign reproducible.
+CHUNK_SEED_STRIDE = 1000
+
+
+def prepare(cfg: GeneratorConfig, force_rebuild: bool = False) -> Path:
+    """Fetch, patch and compile. Safe to call repeatedly; compiles at most once."""
     fetch_source(cfg, force=force_rebuild)
     patch_source(cfg)
     if force_rebuild or not cfg.exe.exists():
         build(cfg)
-    write_input(cfg)
-    return save(build_dataset(cfg, run(cfg)), cfg)
+    return cfg.exe
+
+
+def generate_chunked(
+    cfg: GeneratorConfig,
+    chunk_size: int = 10,
+    chunk_dir: Path | None = None,
+    force_rebuild: bool = False,
+) -> Path:
+    """Generate ``cfg.n_runs`` runs in batches, then merge.
+
+    Each batch is simulated, parsed to ``chunk_XXX.npz``, and its ``plot1.asc``
+    deleted before the next starts. Three reasons:
+
+    - **Disk.** At ``plot_step=0.01`` a run writes ~63 MB of ASCII, so one large
+      ``MONTE`` would hold multiple GB before anything is parsed. Peak usage here
+      is one batch.
+    - **Resumability.** A chunk whose ``.npz`` already exists is skipped, so an
+      interrupted campaign resumes where it stopped rather than restarting.
+    - **Extension.** Chunk ``i`` always uses ``seed = cfg.seed + i*CHUNK_SEED_STRIDE``
+      and ``run_id`` offset ``i*chunk_size``, both independent of the total
+      requested. Raising ``cfg.n_runs`` and re-running therefore computes only the
+      new chunks, with no duplicated draws and no colliding ids.
+
+    The merged result is identical to what a single batch of ``cfg.n_runs`` would
+    have produced.
+    """
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be >= 1")
+
+    chunk_dir = Path(chunk_dir) if chunk_dir else cfg.out_path.parent / "chunks"
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+
+    n_chunks = -(-cfg.n_runs // chunk_size)  # ceil
+    base_seed, total_runs = cfg.seed, cfg.n_runs
+    print(f"[chunk] {total_runs} runs in {n_chunks} chunk(s) of <= {chunk_size}")
+
+    paths: list[Path] = []
+    start = time.monotonic()
+    computed = 0
+
+    for i in range(n_chunks):
+        path = chunk_dir / f"chunk_{i:03d}.npz"
+        paths.append(path)
+        if path.exists():
+            print(f"[chunk] {i + 1}/{n_chunks} exists, skipping {path.name}")
+            continue
+
+        runs = min(chunk_size, total_runs - i * chunk_size)
+        cfg.n_runs = runs
+        cfg.seed = base_seed + i * CHUNK_SEED_STRIDE
+        print(f"\n[chunk] {i + 1}/{n_chunks}  {runs} runs  seed={cfg.seed}")
+
+        chunk_start = time.monotonic()
+        write_input(cfg)
+        plot_file = run(cfg)
+        dataset = build_dataset(cfg, plot_file)
+        dataset["run_id"] = dataset["run_id"] + i * chunk_size
+
+        np.savez_compressed(
+            path, **dataset, config=np.array(str(cfg)), dt=np.array(cfg.plot_step)
+        )
+        # Reclaim before the next batch; this is the whole point of chunking.
+        plot_file.unlink(missing_ok=True)
+
+        computed += 1
+        elapsed = time.monotonic() - chunk_start
+        print(f"[chunk] {path.name} in {elapsed:.0f}s ({elapsed / runs:.1f}s/run)")
+        remaining = n_chunks - i - 1
+        if remaining:
+            done = time.monotonic() - start
+            print(f"[chunk] ~{done / computed * remaining / 60:.0f} min remaining")
+
+    cfg.n_runs, cfg.seed = total_runs, base_seed
+    return merge_datasets(paths, cfg.out_path)
+
+
+def merge_datasets(paths: Sequence[Path], out_path: Path) -> Path:
+    """Concatenate chunk files into one dataset.
+
+    Metadata (state/parameter names, timestep) must agree across chunks -- a
+    mismatch means they came from different configurations and silently stacking
+    them would produce columns that mean different things in different rows.
+    """
+    paths = [Path(p) for p in paths]
+    missing = [p.name for p in paths if not p.exists()]
+    if missing:
+        raise RuntimeError(f"missing chunk files: {missing}")
+
+    merged: dict[str, list[np.ndarray]] = {k: [] for k in _STACKED}
+    meta: dict[str, np.ndarray] = {}
+
+    for path in paths:
+        with np.load(path, allow_pickle=True) as chunk:
+            for key in _STACKED:
+                merged[key].append(chunk[key])
+            for key in ("state_names", "param_names", "dt"):
+                if key in meta and not np.array_equal(meta[key], chunk[key]):
+                    raise RuntimeError(
+                        f"{path.name}: {key} differs from earlier chunks "
+                        f"({chunk[key]} vs {meta[key]}) -- chunks are not comparable"
+                    )
+                meta[key] = chunk[key]
+
+    dataset = {k: np.concatenate(v) for k, v in merged.items()} | meta
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(out_path, **dataset)
+
+    n_runs = len(np.unique(dataset["run_id"]))
+    print(
+        f"\n[merge] {len(paths)} chunks -> {out_path} "
+        f"({len(dataset['x'])} samples, {n_runs} runs, "
+        f"{out_path.stat().st_size / 1e6:.1f} MB)"
+    )
+    return out_path
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -515,14 +708,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--work-dir", type=Path, default=GeneratorConfig.work_dir)
     parser.add_argument("-o", "--out", type=Path, default=GeneratorConfig.out_path)
     parser.add_argument("--rebuild", action="store_true", help="re-clone and recompile")
+    parser.add_argument(
+        "--chunk-size", type=int, default=0,
+        help="generate in batches of this many runs (resumable); 0 = single batch",
+    )
+    parser.add_argument(
+        "--cadac-source", type=Path, default=None,
+        help="local CADAC checkout to copy ROCKET6G from instead of cloning",
+    )
     args = parser.parse_args(argv)
 
     cfg = GeneratorConfig(
         work_dir=args.work_dir, out_path=args.out, n_runs=args.n_runs,
         seed=args.seed, plot_step=args.plot_step, endtime=args.endtime,
+        cadac_source=args.cadac_source,
     )
     try:
-        generate(cfg, force_rebuild=args.rebuild)
+        if args.chunk_size:
+            prepare(cfg, force_rebuild=args.rebuild)
+            generate_chunked(cfg, chunk_size=args.chunk_size)
+        else:
+            generate(cfg, force_rebuild=args.rebuild)
     except (RuntimeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

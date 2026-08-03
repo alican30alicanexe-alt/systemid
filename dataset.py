@@ -54,25 +54,41 @@ class TrajectoryDataset(Dataset):
             }
 
 
-def _split_run_ids(run_ids: np.ndarray, seed: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    unique = np.unique(run_ids)
-    rng = np.random.default_rng(seed)
-    rng.shuffle(unique)
-    n = len(unique)
-    train_n = max(1, int(round(0.7 * n)))
-    val_n = max(1, int(round(0.15 * n)))
-    test_n = max(1, n - train_n - val_n)
-    if train_n + val_n + test_n != n:
-        train_n = n - val_n - test_n
+def _split_run_ids(
+    run_ids: np.ndarray,
+    seed: int,
+    train_fraction: float = 0.7,
+    val_fraction: float = 0.15,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Partition whole trajectories into train/val/test.
 
-    train_ids = unique[:train_n]
-    val_ids = unique[train_n:train_n + val_n]
-    test_ids = unique[train_n + val_n:train_n + val_n + test_n]
-    if len(test_ids) == 0 and n > 1:
-        test_ids = np.array([unique[-1]])
-    if len(val_ids) == 0 and n > 1:
-        val_ids = np.array([unique[-1]])
-    return train_ids, val_ids, test_ids
+    Splitting is by run, never by sample: consecutive samples within a trajectory
+    are one plot step apart and are near-duplicates, so a per-sample split puts
+    each validation point beside a training point taken milliseconds earlier and
+    reports a validation loss close to the training loss however badly the model
+    generalises to an unseen launch.
+
+    Runs are shuffled with ``seed`` first. Monte Carlo runs are ordered by chunk,
+    so an unshuffled slice would hand each partition a different contiguous block
+    of dispersion draws.
+    """
+    unique = np.unique(run_ids)
+    n = len(unique)
+    if n < 3:
+        raise ValueError(
+            f"need at least 3 runs to split, got {n}. Generate more with "
+            "`python3 generator.py -n <N>`."
+        )
+
+    unique = np.random.default_rng(seed).permutation(unique)
+    train_n = min(max(1, round(train_fraction * n)), n - 2)
+    val_n = min(max(1, round(val_fraction * n)), n - train_n - 1)
+
+    return (
+        unique[:train_n],
+        unique[train_n:train_n + val_n],
+        unique[train_n + val_n:],
+    )
 
 
 def _filter_by_run(data: dict[str, np.ndarray], run_ids: np.ndarray) -> dict[str, np.ndarray]:
@@ -87,69 +103,54 @@ def build_loaders(
     train_fraction: float = 0.7,
     val_fraction: float = 0.15,
     num_workers: int = 0,
+    dtype: torch.dtype = torch.float32,
 ) -> tuple[DataLoader, DataLoader, TrajectoryDataset, dict[str, list[str]]]:
-    """Load a .npz dataset and return train/val loaders plus a held-out test set."""
+    """Load a .npz dataset and return train/val loaders plus a held-out test set.
+
+    ``dtype`` defaults to float32 to match the model's parameters. The ``.npz``
+    itself is float64 and should stay that way: float32 spacing at
+    ``|SBII| ~ 6.4e6`` m is 0.5 m, so anything that re-differences the stored
+    positions in float32 picks up ~10 m/s of quantisation noise -- the failure the
+    generator's plot-file precision patch exists to prevent. Nothing in the
+    training path re-differences (``xdot`` is precomputed), and float32 relative
+    precision costs ~1e-6 m/s^2 in the gravity term against a ~0.04 m/s^2
+    residual, so casting down here is safe. Pass ``torch.float64`` for analysis
+    that touches the raw magnitudes.
+    """
     data = np.load(data_path, allow_pickle=True)
     state_names = list(data["state_names"].tolist())
     param_names = list(data["param_names"].tolist())
 
-    x = torch.tensor(data["x"], dtype=torch.float32)
-    p = torch.tensor(data["p"], dtype=torch.float32)
-    t = torch.tensor(data["t"], dtype=torch.float32)
-    xdot = torch.tensor(data["xdot"], dtype=torch.float32)
-    run_id = torch.tensor(data["run_id"], dtype=torch.long)
-
-    unique = sorted(run_id.unique().tolist())
-    if len(unique) < 3:
-        train_ids = np.array(unique[: max(1, int(len(unique) * train_fraction))], dtype=np.int64)
-        val_ids = np.array(unique[len(train_ids):len(train_ids) + 1], dtype=np.int64)
-        test_ids = np.array(unique[-1:], dtype=np.int64)
-    else:
-        n = len(unique)
-        train_n = max(1, int(round(train_fraction * n)))
-        val_n = max(1, int(round(val_fraction * n)))
-        test_n = max(1, n - train_n - val_n)
-        if train_n + val_n + test_n != n:
-            train_n = n - val_n - test_n
-        train_ids = np.array(unique[:train_n], dtype=np.int64)
-        val_ids = np.array(unique[train_n:train_n + val_n], dtype=np.int64)
-        test_ids = np.array(unique[train_n + val_n:train_n + val_n + test_n], dtype=np.int64)
-
-    train_data = _filter_by_run({"x": x.numpy(), "p": p.numpy(), "t": t.numpy(), "xdot": xdot.numpy(), "run_id": run_id.numpy()}, train_ids)
-    val_data = _filter_by_run({"x": x.numpy(), "p": p.numpy(), "t": t.numpy(), "xdot": xdot.numpy(), "run_id": run_id.numpy()}, val_ids)
-    test_data = _filter_by_run({"x": x.numpy(), "p": p.numpy(), "t": t.numpy(), "xdot": xdot.numpy(), "run_id": run_id.numpy()}, test_ids)
-
-    train_dataset = TrajectoryDataset(
-        x=torch.tensor(train_data["x"], dtype=torch.float32),
-        p=torch.tensor(train_data["p"], dtype=torch.float32),
-        t=torch.tensor(train_data["t"], dtype=torch.float32),
-        xdot=torch.tensor(train_data["xdot"], dtype=torch.float32),
-        run_id=torch.tensor(train_data["run_id"], dtype=torch.long),
-        state_names=state_names,
-        param_names=param_names,
-    )
-    val_dataset = TrajectoryDataset(
-        x=torch.tensor(val_data["x"], dtype=torch.float32),
-        p=torch.tensor(val_data["p"], dtype=torch.float32),
-        t=torch.tensor(val_data["t"], dtype=torch.float32),
-        xdot=torch.tensor(val_data["xdot"], dtype=torch.float32),
-        run_id=torch.tensor(val_data["run_id"], dtype=torch.long),
-        state_names=state_names,
-        param_names=param_names,
-    )
-    test_dataset = TrajectoryDataset(
-        x=torch.tensor(test_data["x"], dtype=torch.float32),
-        p=torch.tensor(test_data["p"], dtype=torch.float32),
-        t=torch.tensor(test_data["t"], dtype=torch.float32),
-        xdot=torch.tensor(test_data["xdot"], dtype=torch.float32),
-        run_id=torch.tensor(test_data["run_id"], dtype=torch.long),
-        state_names=state_names,
-        param_names=param_names,
+    raw = {k: data[k] for k in ("x", "p", "t", "xdot", "run_id")}
+    train_ids, val_ids, test_ids = _split_run_ids(
+        raw["run_id"], seed, train_fraction, val_fraction
     )
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
-    return train_loader, val_loader, test_dataset, {"state_names": state_names, "param_names": param_names}
+    def make(run_ids: np.ndarray) -> TrajectoryDataset:
+        part = _filter_by_run(raw, run_ids)
+        return TrajectoryDataset(
+            x=torch.tensor(part["x"], dtype=dtype),
+            p=torch.tensor(part["p"], dtype=dtype),
+            t=torch.tensor(part["t"], dtype=dtype),
+            xdot=torch.tensor(part["xdot"], dtype=dtype),
+            run_id=torch.tensor(part["run_id"], dtype=torch.long),
+            state_names=state_names,
+            param_names=param_names,
+        )
+
+    train_dataset, val_dataset, test_dataset = map(make, (train_ids, val_ids, test_ids))
+    print(
+        f"[data] split by run: train={len(train_ids)} val={len(val_ids)} "
+        f"test={len(test_ids)} runs ({len(train_dataset)} train samples)"
+    )
+
+    common = {"batch_size": batch_size, "num_workers": num_workers}
+    return (
+        DataLoader(train_dataset, shuffle=True, **common),
+        DataLoader(val_dataset, shuffle=False, **common),
+        test_dataset,
+        {"state_names": state_names, "param_names": param_names},
+    )
 
 
 if __name__ == "__main__":
