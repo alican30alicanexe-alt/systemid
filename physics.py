@@ -51,11 +51,12 @@ from torch import Tensor
 # rather than a textbook approximation. A mismatch here would be silently absorbed
 # by the learned correction, which is precisely what the gray-box split exists to
 # prevent.
-GM = 3.9860044e14        # gravitational parameter        - m^3/s^2
-C20 = -4.8416685e-4      # 2nd-degree zonal coefficient   - ND
-SMAJOR_AXIS = 6378137.0  # WGS-84 semi-major axis         - m
-WEII3 = 7.292115e-5      # Earth rotation rate            - rad/s
-GW_CLONG = 0.0           # Greenwich celestial longitude at t=0 - rad
+GM = 3.9860044e14           # gravitational parameter        - m^3/s^2
+C20 = -4.8416685e-4         # 2nd-degree zonal coefficient   - ND
+SMAJOR_AXIS = 6378137.0     # WGS-84 semi-major axis         - m
+FLATTENING = 3.33528106e-3  # WGS-84 flattening              - ND
+WEII3 = 7.292115e-5         # Earth rotation rate            - rad/s
+GW_CLONG = 0.0              # Greenwich celestial longitude at t=0 - rad
 
 DEG = torch.pi / 180.0
 
@@ -92,10 +93,16 @@ class PhysicsModule(ABC):
 
     @abstractmethod
     def contribute(
-        self, x: Tensor, p: Tensor, layout: StateLayout,
+        self, x: Tensor, p: Tensor, t: Tensor, layout: StateLayout,
         A: Tensor, B: Tensor, c: Tensor,
     ) -> None:
-        """Add this module's terms in place. ``x``/``p`` are ``(batch, n)``."""
+        """Add this module's terms in place.
+
+        ``x``/``p`` are ``(batch, n)`` and ``t`` is ``(batch,)`` seconds since
+        launch. ``t`` is not decoration: every inertial<-earth-fixed rotation in
+        CADAC carries ``WEII3 * time``, so a module that ignores it is wrong by
+        the Earth's rotation over the trajectory.
+        """
 
     def exact_blocks(self, layout: StateLayout) -> list[tuple[slice, slice]]:
         """``A`` blocks this module determines exactly, frozen against learning.
@@ -111,7 +118,7 @@ class KinematicsModule(PhysicsModule):
 
     name = "kinematics"
 
-    def contribute(self, x, p, layout, A, B, c) -> None:
+    def contribute(self, x, p, t, layout, A, B, c) -> None:
         pos, vel = layout.s_slice("SBII"), layout.s_slice("VBII")
         A[:, pos, vel] += torch.eye(3, dtype=A.dtype, device=A.device)
 
@@ -121,34 +128,53 @@ class KinematicsModule(PhysicsModule):
 
 
 class GravityJ2Module(PhysicsModule):
-    """WGS-84 J2 gravity as an SDC block on position.
+    """WGS-84 J2 gravity as an SDC block on position, transcribed from CADAC.
 
-    CADAC computes this in geocentric coordinates (``cad_grav84``); the equivalent
-    inertial Cartesian form is used here so it composes as a matrix on ``SBII``::
+    This is a line-by-line port of ``cad_grav84`` plus the ``~TGI * GRAVG`` rotation
+    in ``newton.cpp``, **not** the textbook inertial-Cartesian J2 formula. The two
+    are not the same: CADAC's tangential (north) term carries the opposite sign to
+    the textbook one, a 0.030 m/s^2 disagreement at the launch latitude. Since the
+    training targets are CADAC's own trajectories, any deviation here is learned as
+    aerodynamics -- and 0.030 m/s^2 is most of the ~0.04 m/s^2 aerodynamic residual
+    this framework exists to identify. Match the simulator, not the textbook.
 
-        a = -(GM/r^3)[ I + (3/2) J2 (a_e/r)^2 diag(1-5s^2, 1-5s^2, 3-5s^2) ] r
+    In geocentric (north/east/down) coordinates, with ``latc`` the geocentric
+    latitude and ``r = |SBII|``::
 
-    with ``s = z/r`` and ``J2 = -sqrt(5) C20``.
+        GRAVG = ( -(GM/r^2) 3 sqrt(5) C20 (a_e/r)^2 sin(latc) cos(latc),
+                  0,
+                   (GM/r^2) [1 + (3 sqrt(5)/2) C20 (a_e/r)^2 (3 sin^2(latc) - 1)] )
+
+    SDC form: the geocentric position is ``TGI x = (delta, 0, -r)``, so a matrix
+    whose only populated column is the third maps it onto ``GRAVG`` exactly, and
+    ``A = ~TGI M TGI`` reproduces ``~TGI GRAVG`` to float precision. The empty first
+    two columns are what makes this exact rather than approximate -- they discard
+    the small north residual ``delta`` left by CADAC's small-angle deflection ``dd``,
+    instead of letting it leak into the acceleration.
     """
 
     name = "gravity"
 
-    def contribute(self, x, p, layout, A, B, c) -> None:
+    def contribute(self, x, p, t, layout, A, B, c) -> None:
         pos, vel = layout.s_slice("SBII"), layout.s_slice("VBII")
         r_vec = x[:, pos]
         r = r_vec.norm(dim=1, keepdim=True).clamp_min(1.0)
 
-        j2 = -(5.0 ** 0.5) * C20
-        s2 = (r_vec[:, 2:3] / r) ** 2
-        k = 1.5 * j2 * (SMAJOR_AXIS / r) ** 2
+        # cad_geoc_in: latc = asin(sbii3/dbi), geocentric -- not the geodetic latx.
+        sin_latc = (r_vec[:, 2:3] / r).clamp(-1.0, 1.0)
+        cos_latc = (1.0 - sin_latc.pow(2)).clamp_min(0.0).sqrt()
 
-        diag = torch.stack(
-            [1.0 + k[:, 0] * (1.0 - 5.0 * s2[:, 0]),
-             1.0 + k[:, 0] * (1.0 - 5.0 * s2[:, 0]),
-             1.0 + k[:, 0] * (3.0 - 5.0 * s2[:, 0])],
-            dim=1,
-        )
-        A[:, vel, pos] += torch.diag_embed(-GM / r.pow(3) * diag)
+        dum1 = GM / r.pow(2)
+        dum3 = (SMAJOR_AXIS / r).pow(2)
+        g1 = -dum1 * (3.0 * 5.0 ** 0.5) * C20 * dum3 * sin_latc * cos_latc
+        g3 = dum1 * (1.0 + 1.5 * 5.0 ** 0.5 * C20 * dum3 * (3.0 * sin_latc.pow(2) - 1.0))
+
+        m = torch.zeros(x.shape[0], 3, 3, dtype=A.dtype, device=A.device)
+        m[:, 0, 2] = (-g1 / r)[:, 0]
+        m[:, 2, 2] = (-g3 / r)[:, 0]
+
+        tgi = inertial_to_geocentric(p, layout, t)
+        A[:, vel, pos] += tgi.transpose(1, 2) @ m @ tgi
 
 
 class PropulsionModule(PhysicsModule):
@@ -161,12 +187,12 @@ class PropulsionModule(PhysicsModule):
 
     name = "propulsion"
 
-    def contribute(self, x, p, layout, A, B, c) -> None:
+    def contribute(self, x, p, t, layout, A, B, c) -> None:
         vel = layout.s_slice("VBII")
         thrust = p[:, layout.p("thrust")]
         mass = p[:, layout.p("vmass")].clamp_min(1.0)
 
-        tbi = body_to_inertial(p, layout, x.new_tensor(0.0))
+        tbi = body_to_inertial(p, layout, t)
         # TBI maps inertial -> body, so its transpose maps body -> inertial. The
         # body-frame thrust vector is (T, 0, 0), so we need only TBI's first row.
         c[:, vel] += tbi[:, 0, :] * (thrust / mass).unsqueeze(1)
@@ -183,7 +209,7 @@ class AerodynamicsModule(PhysicsModule):
 
     name = "aerodynamics"
 
-    def contribute(self, x, p, layout, A, B, c) -> None:
+    def contribute(self, x, p, t, layout, A, B, c) -> None:
         return
 
 
@@ -205,6 +231,55 @@ DEFAULT_KNOWN: dict[str, bool] = {
 }
 
 
+def _tdi(lon: Tensor, lat: Tensor, time: Tensor) -> Tensor:
+    """``cad_tdi84``: inertial -> geodetic, batched ``(N, 3, 3)``.
+
+    ``time`` enters through ``lon_cel = GW_CLONG + WEII3 * time + lon`` and is the
+    reason every caller must thread the real sample time: over a 190 s ascent the
+    Earth turns 0.79 deg, which at a thrust specific force of 13-40 m/s^2 is
+    0.2-0.5 m/s^2 of misdirected acceleration.
+    """
+    lon_cel = GW_CLONG + WEII3 * time + lon
+    slon, clon = lon_cel.sin(), lon_cel.cos()
+    slat, clat = lat.sin(), lat.cos()
+    zero = torch.zeros_like(lon_cel)
+
+    return torch.stack([
+        torch.stack([-slat * clon, -slat * slon, clat], dim=1),
+        torch.stack([-slon, clon, zero], dim=1),
+        torch.stack([-clat * clon, -clat * slon, -slat], dim=1),
+    ], dim=1)
+
+
+def inertial_to_geocentric(p: Tensor, layout: StateLayout, time: Tensor) -> Tensor:
+    """``TGI`` (inertial -> geocentric), batched ``(N, 3, 3)``.
+
+    ``cad_tgi84``: ``TGD(dd) * TDI(lon, lat, time)``, where ``dd`` is CADAC's
+    small-angle deflection of the geodetic normal from the geocentric radial. It
+    is built from the *geodetic* ``lonx``/``latx``/``alt``, as in ``newton.cpp``.
+    """
+    lon = p[:, layout.p("lonx")] * DEG
+    lat = p[:, layout.p("latx")] * DEG
+    alt = p[:, layout.p("alt")]
+
+    r0 = SMAJOR_AXIS * (
+        1.0
+        - FLATTENING * (1.0 - (2.0 * lat).cos()) / 2.0
+        + 5.0 * FLATTENING ** 2 * (1.0 - (4.0 * lat).cos()) / 16.0
+    )
+    dd = FLATTENING * (2.0 * lat).sin() * (1.0 - FLATTENING / 2.0 - alt / r0)
+    sd, cd = dd.sin(), dd.cos()
+    zero, one = torch.zeros_like(dd), torch.ones_like(dd)
+
+    tgd = torch.stack([
+        torch.stack([cd, zero, -sd], dim=1),
+        torch.stack([zero, one, zero], dim=1),
+        torch.stack([sd, zero, cd], dim=1),
+    ], dim=1)
+
+    return tgd @ _tdi(lon, lat, time)
+
+
 def body_to_inertial(p: Tensor, layout: StateLayout, time: Tensor) -> Tensor:
     """``TBI`` (inertial -> body), batched ``(N, 3, 3)``.
 
@@ -214,13 +289,10 @@ def body_to_inertial(p: Tensor, layout: StateLayout, time: Tensor) -> Tensor:
     psi = p[:, layout.p("psibdx")] * DEG
     tht = p[:, layout.p("thtbdx")] * DEG
     phi = p[:, layout.p("phibdx")] * DEG
-    lon = p[:, layout.p("lonx")] * DEG
-    lat = p[:, layout.p("latx")] * DEG
 
     sp, cp = psi.sin(), psi.cos()
     st, ct = tht.sin(), tht.cos()
     sph, cph = phi.sin(), phi.cos()
-    zero = torch.zeros_like(psi)
 
     tbd = torch.stack([
         torch.stack([cp * ct, sp * ct, -st], dim=1),
@@ -228,17 +300,9 @@ def body_to_inertial(p: Tensor, layout: StateLayout, time: Tensor) -> Tensor:
         torch.stack([cp * st * cph + sp * sph, sp * st * cph - cp * sph, ct * cph], dim=1),
     ], dim=1)
 
-    lon_cel = GW_CLONG + WEII3 * time + lon
-    slon, clon = lon_cel.sin(), lon_cel.cos()
-    slat, clat = lat.sin(), lat.cos()
-
-    tdi = torch.stack([
-        torch.stack([-slat * clon, -slat * slon, clat], dim=1),
-        torch.stack([-slon, clon, zero], dim=1),
-        torch.stack([-clat * clon, -clat * slon, -slat], dim=1),
-    ], dim=1)
-
-    return tbd @ tdi
+    lon = p[:, layout.p("lonx")] * DEG
+    lat = p[:, layout.p("latx")] * DEG
+    return tbd @ _tdi(lon, lat, time)
 
 
 class PhysicsModel:
@@ -275,7 +339,13 @@ class PhysicsModel:
         return f"PhysicsModel(analytical={on}, learned={off})"
 
     def __call__(self, x: Tensor, p: Tensor, t: Tensor | None = None):
-        """Returns ``(A, B, c)`` shaped ``(N,n,n)``, ``(N,n,m)``, ``(N,n)``."""
+        """Returns ``(A, B, c)`` shaped ``(N,n,n)``, ``(N,n,m)``, ``(N,n)``.
+
+        ``t`` is seconds since launch and reaches the modules -- it sets the
+        Earth's rotation angle in every inertial<-earth-fixed transform. Omitting
+        it means evaluating the whole trajectory at lift-off attitude of the Earth;
+        the default exists only for quick single-point probes.
+        """
         n, batch = self.layout.n_state, x.shape[0]
         opts = {"dtype": x.dtype, "device": x.device}
 
@@ -283,11 +353,10 @@ class PhysicsModel:
         B = torch.zeros(batch, n, self.n_control, **opts)
         c = torch.zeros(batch, n, **opts)
 
-        if t is None:
-            t = torch.zeros(batch, **opts)
+        t = torch.zeros(batch, **opts) if t is None else t.to(**opts).expand(batch)
 
         for module in self.modules:
-            module.contribute(x, p, self.layout, A, B, c)
+            module.contribute(x, p, t, self.layout, A, B, c)
         return A, B, c
 
     def free_mask(self) -> Tensor:

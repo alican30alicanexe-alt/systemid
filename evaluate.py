@@ -245,7 +245,7 @@ def evaluate(
     for i, traj in enumerate(test.trajectories()):
         truth, rollouts = evaluate_trajectory(traj, model, physics)
         table = horizon_table(truth, rollouts)
-        print(f"\n=== test run {traj['run_id']} "
+        print(f"\n=== test run {int(traj['run_id'][0])} "
               f"({len(truth.t)} steps, {truth.t[-1] - truth.t[0]:.1f} s) ===")
         print_horizon_table(table)
         for name, row in table.items():
@@ -253,8 +253,15 @@ def evaluate(
         if i == 0:
             plot_evaluation(truth, rollouts, history, Path(fig_dir) / "evaluation.png")
 
+    # Intersect rather than assume rows[0]'s keys cover every run: horizon_table
+    # drops a horizon holding fewer than two samples, so a run short enough to
+    # miss one has fewer columns than the first. That needs a nearly empty
+    # trajectory at the default plot_step, but the assumption is silent when it
+    # breaks and costs nothing to remove.
+    shared = set.intersection(*(set(r) for rows in aggregate.values() for r in rows))
+    order = [h for h in next(iter(aggregate.values()))[0] if h in shared]
     mean = {
-        name: {h: float(np.mean([r[h] for r in rows])) for h in rows[0]}
+        name: {h: float(np.mean([r[h] for r in rows])) for h in order}
         for name, rows in aggregate.items()
     }
     print(f"\n=== mean over {len(next(iter(aggregate.values())))} test runs ===")

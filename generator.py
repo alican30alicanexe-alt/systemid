@@ -109,12 +109,16 @@ DEFAULT_PARAMS: tuple[str, ...] = (
     "fmassr",   # remaining fuel mass     - kg
     "vmach",    # Mach number             - ND
     "pdynmc",   # dynamic pressure        - Pa
+    # Load-bearing, not diagnostic: physics.py needs alt for CADAC's geodetic-to-
+    # geocentric deflection dd in inertial_to_geocentric(), which the gravity block
+    # rides on. Dropping it breaks gravity, not just a plot axis.
     "alt",      # altitude                - m
     "alphax",   # angle of attack         - deg
     "betax",    # sideslip angle          - deg
     # Attitude and geodetic position: needed to rotate body-frame thrust into the
-    # inertial frame (TBI = TBD(euler) * TDI(lon, lat, time)). physics.py reads all
-    # five out of p in body_to_inertial(); omitting them raises KeyError there.
+    # inertial frame (TBI = TBD(euler) * TDI(lon, lat, time)), and lonx/latx again
+    # for TGI in the gravity block. physics.py reads these out of p in
+    # body_to_inertial() / inertial_to_geocentric(); omitting them raises KeyError.
     "phibdx", "thtbdx", "psibdx",  # Euler angles, body wrt geodetic - deg
     "lonx", "latx",                # geodetic longitude / latitude   - deg
 )
@@ -391,6 +395,15 @@ def run(cfg: GeneratorConfig, timeout: float = 7200.0) -> Path:
     )
     if not plot_file.exists() or plot_file.stat().st_size == 0:
         raise RuntimeError(f"no trajectory output.\n{result.stdout[-2000:]}")
+    # A crash partway through a MONTE block leaves a plot1.asc that parses cleanly
+    # but holds fewer runs than asked for, so the only symptom of a failed run is a
+    # quietly short dataset. Fail here instead.
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"simulation exited {result.returncode} after writing "
+            f"{plot_file.stat().st_size / 1e6:.1f} MB; output is incomplete.\n"
+            f"{result.stdout[-2000:]}\n{result.stderr[-2000:]}"
+        )
     print(f"[run] plot1.asc {plot_file.stat().st_size / 1e6:.1f} MB")
     return plot_file
 
