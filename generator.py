@@ -325,26 +325,38 @@ def build(cfg: GeneratorConfig) -> Path:
 # 4-5. input generation and execution
 # --------------------------------------------------------------------------- #
 
-def _disperse_line(line: str, dispersions: dict[str, tuple[float, float]]) -> str:
+def _disperse_line(
+    line: str, dispersions: dict[str, tuple[float, float]], done: set[str]
+) -> tuple[str, str | None]:
     """Wrap a scalar assignment in a ``GAUSS`` dispersion if it is being randomised.
 
     CADAC input lines are ``<indent><name>  <value>  //comment``. The stochastic
-    form is ``<indent>GAUSS <name>  <mean>  <sigma>  //comment``.
+    form is ``<indent>GAUSS <name>  <mean>  <sigma>  //comment``. Returns the
+    rewritten line and the name dispersed, or ``(line, None)`` if untouched.
+
+    Names already in ``done`` are left alone, which is load-bearing rather than an
+    optimisation. ROCKET6G's deck assigns ``vmass0`` and ``spi`` once per stage --
+    four lines each -- so matching on the name alone rewrites stage 2's 15490 kg
+    and stage 3's 5024 kg with stage 1's dispersed 48984 kg, replacing both upper
+    stages with copies of the booster. Only the first occurrence is dispersed,
+    matching what :data:`DEFAULT_DISPERSIONS` documents ("stage-1 gross mass").
+    Dispersing an upper stage would need stage-scoped keys, which this does not do.
     """
     match = re.match(r"^(\s*)([A-Za-z_]\w*)(\s+)(\S+)(.*)$", line)
     if not match:
-        return line
+        return line, None
     indent, name, _, _, tail = match.groups()
-    if name not in dispersions:
-        return line
+    if name not in dispersions or name in done:
+        return line, None
     mean, sigma = dispersions[name]
-    return f"{indent}GAUSS {name}  {mean:g}  {sigma:g}{tail}"
+    return f"{indent}GAUSS {name}  {mean:g}  {sigma:g}{tail}", name
 
 
 def write_input(cfg: GeneratorConfig) -> Path:
     """Derive ``input.asc`` from the stock scenario: MONTE block, timing, dispersions."""
     template = (cfg.src_dir / cfg.source).read_text().split("\n")
     seen: set[str] = set()
+    occurrences: dict[str, int] = {}
     out: list[str] = []
 
     for line in template:
@@ -361,9 +373,12 @@ def write_input(cfg: GeneratorConfig) -> Path:
                 out.append(f"\t{key} {value:g}")
                 break
         else:
-            dispersed = _disperse_line(line, cfg.dispersions)
-            if dispersed != line:
-                seen.add(stripped.split()[0])
+            dispersed, applied = _disperse_line(line, cfg.dispersions, seen)
+            if applied:
+                seen.add(applied)
+            head = stripped.split()[0] if stripped else ""
+            if head in cfg.dispersions:
+                occurrences[head] = occurrences.get(head, 0) + 1
             out.append(dispersed)
 
     missing = set(cfg.dispersions) - seen
@@ -380,6 +395,15 @@ def write_input(cfg: GeneratorConfig) -> Path:
         f"[input] MONTE {cfg.n_runs} seed={cfg.seed} plot_step={cfg.plot_step:g} "
         f"dispersing {sorted(seen)}"
     )
+    # Print the per-stage repeats rather than swallowing them: which occurrence got
+    # dispersed is the difference between a 2 kg spread on the booster and rebuilding
+    # the upper stages, and it should not be something you have to read the code for.
+    repeats = {name: n - 1 for name, n in occurrences.items() if n > 1}
+    if repeats:
+        print(
+            f"[input] left at their deck values (later per-stage assignments): "
+            f"{repeats}"
+        )
     return path
 
 
