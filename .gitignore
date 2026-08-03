@@ -1,8 +1,45 @@
+# Generated data and training artifacts
 cadac_work/
 data/
 *.npz
 checkpoints/
 figures/
+
+# Python
 __pycache__/
 *.pyc
 .venv/
+
+# CADAC build byproducts, if a simulation is ever built in-tree.
+# generator.py copies sources into cadac_work/ and builds there, so this only
+# matters for a manual `make` inside CADAC/example/<SIM>/.
+CADAC/example/*/*.o
+CADAC/example/*/agm6
+CADAC/example/*/aim5
+CADAC/example/*/ads6
+CADAC/example/*/ball3
+CADAC/example/*/cruise5
+CADAC/example/*/falcon6
+CADAC/example/*/ghame3
+CADAC/example/*/ghame6
+CADAC/example/*/magsix
+CADAC/example/*/rocket6g
+CADAC/example/*/sraam6
+
+# NEVER add `*.asc` here, and do not restore CADAC/.gitignore.
+#
+# The upstream CADAC repository ships its own .gitignore containing `*.asc`.
+# Left in place it silently dropped 126 files -- every CADAC data deck, including
+# ROCKET6G's aero_deck_SLV.asc, weather_deck_Wallops.asc and input_insertion.asc,
+# without which the simulation cannot run. `git add -A` reported success while
+# staging none of them.
+#
+# A nested .gitignore takes precedence over this file for paths beneath it, so a
+# `!*.asc` rule here would NOT override a restored CADAC/.gitignore. The only
+# defence is that the file stays deleted. Verify with:
+#
+#     git status --porcelain --ignored | grep '\.asc'      # must print nothing
+#     git ls-files '*.asc' | wc -l                         # must be 126
+#
+# Note that running a simulation in-tree rewrites two *tracked* decks
+# (doc.asc, input_copy.asc). That is why builds belong in cadac_work/.
