@@ -57,6 +57,11 @@ import numpy as np
 
 CADAC_REPO = "https://github.com/missiondesignsolutions/CADAC.git"
 
+#: CADAC sources committed alongside this file, so generation needs no network.
+#: See ``cadac/NOTICE.md`` for provenance, licence and the diff-check against
+#: upstream. Used automatically when present; upstream is cloned otherwise.
+VENDORED_CADAC = Path(__file__).resolve().parent / "cadac"
+
 #: ``(file, variable, output-field-after-patch)``. The final ``init()`` argument is
 #: the output field; ``plot`` routes the variable into ``plot1.asc``.
 PLOT_FLAGS: tuple[tuple[str, str, str], ...] = (
@@ -139,8 +144,8 @@ class GeneratorConfig:
     out_path: Path = Path("data/rocket6g.npz")
     source: str = "input_insertion.asc"
 
-    #: Local CADAC checkout to copy ROCKET6G from. ``None`` clones upstream, which
-    #: stays the default -- see :func:`fetch_source` for why a local copy is opt-in.
+    #: CADAC checkout to copy ROCKET6G from. ``None`` uses the sources vendored
+    #: alongside this file, falling back to cloning upstream if they are absent.
     cadac_source: Path | None = None
 
     n_runs: int = 200
@@ -195,11 +200,12 @@ def _find_rocket6g(root: Path) -> Path:
 def fetch_source(cfg: GeneratorConfig, force: bool = False) -> Path:
     """Populate ``cfg.src_dir`` with ROCKET6G. Idempotent unless ``force``.
 
-    Uses ``cfg.cadac_source`` when set -- a local CADAC checkout, no network. That
-    is not the default: every measured number in this framework came from the
-    upstream repo, and a local checkout may be an edited copy (pyCAS ships a
-    cleaned ROCKET6G whose MSVC declarations are already fixed). Diff-check a
-    local source against upstream before relying on it.
+    Resolution order: an explicit ``cfg.cadac_source``, then the sources vendored
+    at :data:`VENDORED_CADAC`, then a clone of upstream. The vendored copy is
+    preferred because Colab runtimes are ephemeral -- re-cloning CADAC every
+    session is slow and makes generation depend on a third-party repository
+    staying reachable. It is diff-checked bit-identical to upstream; see
+    ``cadac/NOTICE.md``.
     """
     if cfg.src_dir.exists() and not force:
         print(f"[fetch] reusing {cfg.src_dir}")
@@ -210,7 +216,10 @@ def fetch_source(cfg: GeneratorConfig, force: bool = False) -> Path:
     cfg.work_dir.mkdir(parents=True, exist_ok=True)
     if cfg.cadac_source is not None:
         source = _find_rocket6g(Path(cfg.cadac_source).expanduser())
-        print(f"[fetch] local source {source}")
+        print(f"[fetch] source {source}")
+    elif (VENDORED_CADAC / "ROCKET6G" / "newton.cpp").is_file():
+        source = VENDORED_CADAC / "ROCKET6G"
+        print(f"[fetch] vendored source {source}")
     else:
         clone = cfg.work_dir / "_cadac_clone"
         if not clone.exists():
