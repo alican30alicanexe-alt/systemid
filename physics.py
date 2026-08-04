@@ -215,21 +215,9 @@ class PropulsionModule(PhysicsModule):
 
     def contribute(self, x, p, t, layout, A, B, c) -> None:
         vel = layout.s_slice("VBII")
-        thrust = p[:, layout.p("thrust")]
-        mass = p[:, layout.p("vmass")].clamp_min(1.0)
-
-        eta = p[:, layout.p("etax")] * DEG
-        zet = p[:, layout.p("zetx")] * DEG
-        # tvc.cpp lines 118-120, exactly. Note |FPB| == thrust for any deflection:
-        # the gimbal redirects thrust, it does not throttle it.
-        fpb = torch.stack([
-            eta.cos() * zet.cos(),
-            eta.cos() * zet.sin(),
-            -eta.sin(),
-        ], dim=1) * (thrust / mass).unsqueeze(1)
-
         # TBI maps inertial -> body, so its transpose maps body -> inertial.
         tbi = body_to_inertial(p, layout, t)
+        fpb = thrust_specific_force_body(p, layout)
         c[:, vel] += torch.bmm(tbi.transpose(1, 2), fpb.unsqueeze(-1)).squeeze(-1)
 
 
@@ -313,6 +301,59 @@ def inertial_to_geocentric(p: Tensor, layout: StateLayout, time: Tensor) -> Tens
     ], dim=1)
 
     return tgd @ _tdi(lon, lat, time)
+
+
+def thrust_specific_force_body(p: Tensor, layout: StateLayout) -> Tensor:
+    """Modelled thrust per unit mass in body axes, ``(N, 3)`` -- ``FPB/vmass``.
+
+    Transcribes ``tvc.cpp`` lines 118-120::
+
+        FPB = thrust * (cos(eta) cos(zet), cos(eta) sin(zet), -sin(eta))
+
+    ``|FPB| == thrust`` for any deflection: the gimbal redirects thrust, it does not
+    throttle it. With ``etax``/``zetx`` at zero -- which is how CADAC holds them
+    whenever ``mtvc == 0`` -- this collapses to ``(thrust, 0, 0)``, so the single
+    expression covers both branches of ``forces.cpp``.
+
+    Factored out so :class:`PropulsionModule` and :func:`aerodynamic_truth` cannot
+    drift apart. They must agree exactly: the truth comparison subtracts this from
+    CADAC's ``FSPB``, so any difference between the two would show up as a physics
+    error that is really just two transcriptions of the same equation disagreeing.
+    """
+    thrust = p[:, layout.p("thrust")]
+    mass = p[:, layout.p("vmass")].clamp_min(1.0)
+    eta = p[:, layout.p("etax")] * DEG
+    zet = p[:, layout.p("zetx")] * DEG
+
+    return torch.stack([
+        eta.cos() * zet.cos(),
+        eta.cos() * zet.sin(),
+        -eta.sin(),
+    ], dim=1) * (thrust / mass).unsqueeze(1)
+
+
+def aerodynamic_truth(
+    p: Tensor, fspb: Tensor, layout: StateLayout, time: Tensor
+) -> Tensor:
+    """CADAC's own aerodynamic specific force in inertial coordinates, ``(N, 3)``.
+
+    ``newton.cpp`` integrates ``ABII = ~TBI*FSPB + ~TGI*GRAVG``, where ``FSPB`` is
+    every non-gravitational force per unit mass in body axes. Subtracting the
+    modelled thrust leaves aerodynamics alone::
+
+        a_aero = ~TBI * (FSPB - FPB/vmass)
+
+    This is ground truth for ``dA x + dc`` -- the quantity the whole framework
+    exists to identify -- so it turns "the residual must be aerodynamics, because
+    nothing else is left" from an argument into a measurement.
+
+    ``fspb`` comes from the dataset's ``fspb`` array, which is deliberately kept
+    out of the parameter vector: it *contains* the aerodynamic force, so feeding it
+    to the network as an input would let the model copy the answer.
+    """
+    tbi = body_to_inertial(p, layout, time)
+    extra = fspb - thrust_specific_force_body(p, layout)
+    return torch.bmm(tbi.transpose(1, 2), extra.unsqueeze(-1)).squeeze(-1)
 
 
 def body_to_inertial(p: Tensor, layout: StateLayout, time: Tensor) -> Tensor:

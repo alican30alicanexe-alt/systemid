@@ -273,12 +273,14 @@ rotational subsystem is out of scope and Euler-rate kinematics are singular at
 - **Rollout is a batch-size-1 Python loop** (`evaluate._euler`): ~19,000 model
   calls per rollout at `plot_step=0.01`, three rollouts per test trajectory.
   Budget tens of minutes. Batching across trajectories would fix it.
-- **`FSPB` is stored but only used manually.** The `.npz` carries CADAC's own
-  non-gravitational specific force, so `dA x + dc` can be scored against ground
-  truth directly instead of judged by the three plausibility checks in the
-  training notebook. It is wired into neither `trainer.py` nor `evaluate.py`. A
-  per-`pdynmc`-bucket error against `fspb` would be the single most informative
-  metric this project could report, and is a small change.
+- **`FSPB` is deliberately not in `trainer.py`.** It is carried through
+  `dataset.py` and scored in section 9 of the training notebook, but adding it to
+  `bucket_metrics` would be redundant: that metric is
+  `(xdot_pred - xdot_true)[:, vel]`, and since aerodynamics is the only unknown,
+  `xdot_true - xdot_known = aero_true` and `xdot_pred - xdot_known = aero_pred`.
+  The existing number *is* the aero identification error. `FSPB` earns its keep
+  where the decomposition matters — direction agreement, per-bucket relative
+  error — not as a second name for the same scalar.
 - **`FAPB` is plotted but unused**, and now redundant — `FSPB` is `FAPB/vmass`
   and is the form `newton.cpp` actually integrates. Dropping `FAPB` from
   `PLOT_FLAGS` would shrink `plot1.asc` by three columns at no cost.

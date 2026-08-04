@@ -24,6 +24,11 @@ class TrajectoryDataset(Dataset):
     t: torch.Tensor
     xdot: torch.Tensor
     run_id: torch.Tensor
+    #: CADAC's own non-gravitational specific force, body axes, m/s^2. Ground truth
+    #: for the identified aerodynamics via ``physics.aerodynamic_truth``; carried
+    #: through so analysis can score ``dA x + dc`` against it. Never an input to the
+    #: model -- it contains the force the model is supposed to identify.
+    fspb: torch.Tensor
     state_names: list[str]
     param_names: list[str]
 
@@ -37,6 +42,7 @@ class TrajectoryDataset(Dataset):
             "t": self.t[index],
             "xdot": self.xdot[index],
             "run_id": self.run_id[index],
+            "fspb": self.fspb[index],
         }
 
     def trajectories(self) -> Iterator[dict[str, torch.Tensor]]:
@@ -51,6 +57,7 @@ class TrajectoryDataset(Dataset):
                 "t": self.t[idx],
                 "xdot": self.xdot[idx],
                 "run_id": torch.full((len(idx),), rid, dtype=self.run_id.dtype),
+                "fspb": self.fspb[idx],
             }
 
 
@@ -93,7 +100,8 @@ def _split_run_ids(
 
 def _filter_by_run(data: dict[str, np.ndarray], run_ids: np.ndarray) -> dict[str, np.ndarray]:
     keep = np.isin(data["run_id"], run_ids)
-    return {k: v[keep] for k, v in data.items() if k in {"x", "p", "t", "xdot", "run_id"}}
+    keys = {"x", "p", "t", "xdot", "run_id", "fspb"}
+    return {k: v[keep] for k, v in data.items() if k in keys}
 
 
 def build_loaders(
@@ -121,7 +129,13 @@ def build_loaders(
     state_names = list(data["state_names"].tolist())
     param_names = list(data["param_names"].tolist())
 
-    raw = {k: data[k] for k in ("x", "p", "t", "xdot", "run_id")}
+    if "fspb" not in data:
+        raise KeyError(
+            f"{data_path} has no 'fspb' array -- it predates the truth column. "
+            "Delete the chunk directory and regenerate; see the chunk-cache trap "
+            "in CLAUDE.md."
+        )
+    raw = {k: data[k] for k in ("x", "p", "t", "xdot", "run_id", "fspb")}
     train_ids, val_ids, test_ids = _split_run_ids(
         raw["run_id"], seed, train_fraction, val_fraction
     )
@@ -134,6 +148,7 @@ def build_loaders(
             t=torch.tensor(part["t"], dtype=dtype),
             xdot=torch.tensor(part["xdot"], dtype=dtype),
             run_id=torch.tensor(part["run_id"], dtype=torch.long),
+            fspb=torch.tensor(part["fspb"], dtype=dtype),
             state_names=state_names,
             param_names=param_names,
         )
