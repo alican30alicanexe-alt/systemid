@@ -29,9 +29,66 @@ aerodynamic:
 | 1000–10000 Pa | 0.5465 |
 | 10000+ Pa | **5.2530** |
 
-Median over a whole ascent is 0.113 m/s². A 30-epoch run on 2 training
-trajectories already takes max-Q error from 5.2654 to 0.5295 m/s², and
-full-trajectory rollout RMS from 24363 m to 573 m against a 78 m integrator floor.
+Median over a whole ascent is 0.113 m/s².
+
+### Trained: prediction is finished, interpretation is not
+
+A 50-run dataset (948450 samples, 35 train / 8 val / 7 test) trained 100 epochs
+identifies the aerodynamics essentially perfectly, and produces a matrix that
+means nothing. Both halves are measured.
+
+| pdynmc | \|a_true\| | \|error\| | rel |
+|---|---|---|---|
+| 0–10 Pa | 0.0000 | 0.0032 | — |
+| 10–1000 Pa | 0.0727 | 0.0056 | 7.8% |
+| 1000–10000 Pa | 0.7105 | 0.0122 | 1.7% |
+| 10000+ Pa | 5.1913 | 0.0275 | **0.5%** |
+
+`cos(a_ident, a_true)` at max-Q is **+1.000**. Full-trajectory rollout RMS is
+**79.6 m against a 65.3 m integrator floor** — 1.22× the best any model could
+achieve with forward Euler at this step, versus 24295 m for analytical alone.
+
+But at `lambda_reg = 1e-4` the force sits in the wrong block:
+
+```
+dA[3:6,0:3] @ r  (gravity-shaped)   4.4832 m/s²
+dA[3:6,3:6] @ v  (drag-shaped)      0.2727        <- ~5% of the force
+dc[3:6]          (offset)           0.4061
+```
+
+Going from 4 runs to 50 made prediction 16× better and this split **worse** (the
+drag block was 13% at 4 runs). That is not a bug: 21 unknowns against 3 equations
+is underdetermined at every sample independently, so no amount of data resolves it.
+
+### The sweep: `lambda_reg` fixes it, and 1e-4 was ~1000× too weak
+
+3 seeds × 4 λ, on a 10-run subset at 15 epochs — 8.9 min total, because
+identifiability is structural and does not need the full dataset.
+
+| λ | pred disagr | matrix disagr | err maxQ |
+|---|---|---|---|
+| 0 | 0.0107 | 0.4179 | 0.1230 |
+| 1e-3 | 0.0213 | 0.3998 | 0.1241 |
+| 1e-2 | 0.0143 | **0.1941** | 0.1205 |
+| 1e-1 | 0.0259 | **0.0540** | 0.1429 |
+
+Three findings:
+
+- **The λ=0 row is the textbook non-identified signature** — seeds agree on
+  predictions to 1.1% and disagree on the matrix by 42%.
+- **Ambiguity and physics live in different directions.** 0 → 1e-2 halves matrix
+  disagreement at *no* accuracy cost. The feared outcome — accuracy collapsing
+  before the ambiguity resolves — did not happen.
+- **`val_mse` is blind to all of this**: 0.52561 / 0.52559 / 0.52556 / 0.52557
+  while matrix disagreement moved 8×. Tuning λ on validation loss would conclude it
+  does not matter. Only a multi-seed comparison sees it.
+
+`λ = 1e-2` is free; `λ = 1e-1` is where the matrix becomes trustworthy, for 16%
+accuracy on a model already at the integrator floor.
+
+⚠️ Low matrix disagreement proves the seeds agree **with each other**, not with the
+truth. CADAC's aerodynamics have no closed-form `A` to check against. That gap is
+what [FALLING_BODY.md](FALLING_BODY.md) exists to close.
 
 Two datasets exist locally, both gitignored: `data/smoke.npz` (2 runs) and
 `data/smoke4.npz` (4 runs). Both are too small to train on — 4 runs splits to
@@ -39,24 +96,18 @@ Two datasets exist locally, both gitignored: `data/smoke.npz` (2 runs) and
 
 Next actions, in order:
 
-1. Regenerate on Colab with [colab_generate_data.ipynb](colab_generate_data.ipynb).
-   **Delete `MyDrive/systemid/data/chunks` first** — any existing chunk predates
-   both the `fspb` array and the `etax`/`zetx` parameters, and the cache is keyed
-   by index alone. `merge_datasets` now raises rather than merging such a chunk,
-   but only for keys in `_STACKED`; a stale `param_names` is caught by the
-   metadata check.
-2. Confirm the log contains
-   `[input] left at their deck values (later per-stage assignments): {'vmass0': 2, 'spi': 2}`.
-   That line only exists in post-fix code; its absence means Colab cloned stale.
-3. Confirm the mass plot falls monotonically, with **downward** steps at ~61 s
-   and ~112 s (48984 → 15490 → 5024 kg). Verified 2026-08-04 on 8 ascents.
-4. Train with [colab_train.ipynb](colab_train.ipynb), which enforces the residual
-   gate before it will train. Or `python run.py --data <npz> --epochs 200`.
-5. Sweep `lambda_reg`. At the default 1e-4 on 2 trajectories the identified `dA` is
-   **not** yet interpretable: the position block dominates the velocity block at
-   max-Q and `sym(dA[3:6,3:6])` is not negative-definite, i.e. the fit is good and
-   the factorisation is arbitrary. This is the expected under-determined regime,
-   not a bug — see `identifiability.py`.
+1. **One 100-epoch run at `lambda_reg = 0.1`** on the full 50-run dataset, then read
+   section 9 of the training notebook. The sweep predicts the force moves into the
+   velocity block; that run is the difference between predicting a readable drag
+   model and having one. This is the only thing still open on `main`.
+2. Then [FALLING_BODY.md](FALLING_BODY.md) — the same investigation at 3 unknowns
+   instead of 21, where the true matrix is known in closed form.
+
+To regenerate data (only if the schema changes again): run
+[colab_generate_data.ipynb](colab_generate_data.ipynb) and **delete
+`MyDrive/systemid/data/chunks` first** — the cache is keyed by index alone, so a
+schema change does not invalidate it. Cell 4 now asserts the schema at import; cell
+14 runs both gates and prints an OK/FAIL verdict.
 
 A phone-readable version of this status lives at
 <https://claude.ai/code/artifact/2cc52cac-e4be-4fc3-a997-accd26053f42>.
@@ -76,6 +127,7 @@ A phone-readable version of this status lives at
 | [identifiability.py](identifiability.py) | Multi-seed sweep: does the recovered matrix mean anything? |
 | [run.py](run.py) | End-to-end entry point. |
 | [colab_train.ipynb](colab_train.ipynb) | Colab training: gate → train → inspect `dA` → rollout → sweep. |
+| [FALLING_BODY.md](FALLING_BODY.md) | Plan for the `falling-body` branch: the same identifiability question at n=2, where the true matrix is known in closed form. |
 | [CADAC/](CADAC/) | Vendored upstream checkout. See [CADAC_NOTICE.md](CADAC_NOTICE.md). |
 
 Working dirs `cadac_work/`, `data/`, `checkpoints/`, `figures/` are gitignored.
@@ -248,8 +300,19 @@ after touching any analytical module.
 non-unique — 18 free entries and 3 offsets producing 3 accelerations. Low
 prediction disagreement with high matrix disagreement across seeds means the model
 fits well but is not identified, and the recovered matrices are arbitrary.
-`lambda_reg` is the knob. **Not yet run on a real dataset**; the 4-run smoke test
-shows the under-determined signature clearly, so expect this to matter.
+`lambda_reg` is the knob.
+
+Run 2026-08-04 on the 50-run dataset; numbers in "Current state" above. It found
+the non-identified signature at λ=0 (1.1% prediction spread, 42% matrix spread) and
+showed λ=1e-1 collapses that to 5.4%. **Re-run it after any change that alters what
+the network must explain** — a new analytical module, a state or parameter change,
+or a different loss. It is cheap if you shrink the problem first: identifiability is
+structural, so a 10-run subset at 15 epochs answers it in ~9 minutes where the full
+dataset takes hours.
+
+This gate is the only one that can see the difference between "fits well" and
+"means something". `val_mse` cannot: it moved in the fourth decimal place across a
+sweep where matrix disagreement changed 8×.
 
 ---
 

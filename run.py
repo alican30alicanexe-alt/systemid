@@ -26,7 +26,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--batch-size", type=int, default=2048)
     parser.add_argument("--lr", type=float, default=2e-3)
-    parser.add_argument("--lambda-reg", type=float, default=1e-4)
+    # 0.1 is measured -- see TrainConfig.lambda_reg for the sweep it came from.
+    parser.add_argument("--lambda-reg", type=float, default=0.1)
     parser.add_argument("--hidden", type=int, nargs="+", default=[128, 128])
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--run-name", type=str, default="graybox")

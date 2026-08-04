@@ -31,7 +31,15 @@ class TrainConfig:
 
     #: Identifiability knob. Zero leaves the SDC factorisation non-unique; too
     #: large suppresses genuine missing physics along with the ambiguity.
-    lambda_reg: float = 1e-4
+    #:
+    #: 0.1 is measured, not chosen. On the 50-run dataset a 3-seed sweep gave matrix
+    #: disagreement 0.4179 / 0.3998 / 0.1941 / 0.0540 at lambda 0 / 1e-3 / 1e-2 /
+    #: 1e-1, for max-Q error 0.1230 / 0.1241 / 0.1205 / 0.1429. The previous default
+    #: of 1e-4 left the tie-breaker effectively off: predictions were excellent and
+    #: the recovered matrix was arbitrary, with the drag block carrying ~5% of the
+    #: aerodynamic force. Lower this only if predictive accuracy matters more than
+    #: reading the matrix.
+    lambda_reg: float = 0.1
 
     #: Epochs without validation improvement before stopping.
     patience: int = 25
