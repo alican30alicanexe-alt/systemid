@@ -292,7 +292,20 @@ structured | free_mask = [[0, 0], [0, 1]] | free entries 1
 ```
 
 Exactly determined. If the model fits at all, `dA[1,1]` *must* be `-(k/m)|v|`, and λ
-should become nearly irrelevant — which is the test.
+should become nearly irrelevant.
+
+⚠️ **This is algebra, not discovery, and the result must not be read as more.**
+With one channel left, `dA[1,1] = force/v`, and `|force/v − (-(k/m)|v|)|` is
+**1.49e-08** across the test set. Fitting the force and recovering the coefficient
+are the same act. A clean experiment 5 therefore shows:
+
+- **the structural claim is compatible with the data** — if drag genuinely depended
+  on height, accuracy would collapse under the constraint, so the number to watch is
+  `q40_inf` against the unstructured 0.1502, not `dA[1,1]`'s error;
+- **the ambiguity is gone by construction**, leaving λ nothing to do.
+
+It does *not* show that the network found the drag law. Nothing here could: the
+network is being handed the only channel that exists.
 
 ```bash
 python3 fall.py --train --data data/fall.npz --structured --lambda-reg 0.0
@@ -306,6 +319,28 @@ from the mask, not the regulariser. On ROCKET6G the analogue is available and tr
 aerodynamic force depends on velocity, density and attitude, not on inertial
 position — so `dA[3:6,0:3]`, the block that wrongly carried 4.4832 m/s², is exactly
 the block that should have been frozen.
+
+Given the caveat above, the ROCKET6G experiment is **not** "does the matrix improve"
+— freezing the block removes the misattribution by fiat, so it must. The question is
+whether the 0.5%-at-max-Q accuracy survives the constraint. If it does, the block was
+never carrying physics and the 4.4832 m/s² was pure factorisation slack. If accuracy
+degrades, the constraint is false and something genuinely does depend on position —
+which would itself be worth knowing.
+
+### Two known weaknesses in the measurement
+
+- **`residual_scale[0] = 1e-6` multiplies the frozen row by 1e6.** It is safe only
+  because `dy/dt = v` is exactly representable in float32, verified: the row-0 error
+  is `0.000e+00` and its share of the MSE is `0.000000e+00`, not merely small. Noisy
+  `xdot` or an approximate kinematics module would detonate the loss. `GATE_OK`
+  requires the row-0 residual below 1e-9, so it is caught — but the margin is zero by
+  construction rather than by slack.
+- **Checkpoints are selected on `val_mse`, which is blind to the matrix.** At low λ
+  many epochs are indistinguishable in loss and quite different in factorisation, so
+  the 2.0703 / 3.9214 / 1.4165 split carries an unquantified epoch-selection
+  component. The conclusion is unaffected — 52% misattribution is not an epoch
+  artefact, and it reproduced bit-identically across two runs — but the third decimal
+  is not meaningful.
 
 ---
 
