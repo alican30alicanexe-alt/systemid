@@ -135,8 +135,14 @@ class GravityJ2Module(PhysicsModule):
     are not the same: CADAC's tangential (north) term carries the opposite sign to
     the textbook one, a 0.030 m/s^2 disagreement at the launch latitude. Since the
     training targets are CADAC's own trajectories, any deviation here is learned as
-    aerodynamics -- and 0.030 m/s^2 is most of the ~0.04 m/s^2 aerodynamic residual
-    this framework exists to identify. Match the simulator, not the textbook.
+    aerodynamics. That is small against the 5.25 m/s^2 aerodynamic force at max-Q,
+    but the residual's median over a whole ascent is 0.113 m/s^2 and most of the
+    trajectory is near-vacuum, where the aerodynamic signal is zero and a 0.030
+    m/s^2 bias is the entire measurement. Match the simulator, not the textbook.
+
+    Verified against CADAC's own ``FSPB``: this block plus ``PropulsionModule``
+    reproduces ``~TBI*FSPB + ~TGI*GRAVG`` to a median 4.0e-05 m/s^2, and to 8e-06
+    m/s^2 at max-Q (2 runs, 37938 samples).
 
     In geocentric (north/east/down) coordinates, with ``latc`` the geocentric
     latitude and ``r = |SBII|``::
@@ -178,11 +184,31 @@ class GravityJ2Module(PhysicsModule):
 
 
 class PropulsionModule(PhysicsModule):
-    """Thrust along the body x-axis, rotated into inertial coordinates.
+    """Gimballed thrust, rotated into inertial coordinates.
 
     Contributes to ``c``, not ``A`` -- see the module docstring. ``TBI = TBD * TDI``
-    reproduces CADAC's ``mat3tr`` and ``cad_tdi84``; specific force is ``thrust/vmass``
-    since ``forces.cpp`` adds thrust to ``FAPB[0]``.
+    reproduces CADAC's ``mat3tr`` and ``cad_tdi84``; specific force is the body-axis
+    thrust vector over ``vmass``, since ``newton.cpp`` forms ``FSPB = FAPB/vmass``.
+
+    Thrust does not point along body x
+    ----------------------------------
+    ``forces.cpp`` has two branches. With ``mtvc == 0`` it adds thrust to ``FAPB[0]``
+    alone; with ``mtvc`` in 1..3 it adds the gimballed vector ``FPB`` from
+    ``tvc.cpp``::
+
+        FPB = thrust * (cos(eta) cos(zet), cos(eta) sin(zet), -sin(eta))
+
+    ``input_insertion.asc`` sets ``mtvc 2`` at ``time > 10`` and back to 0 at
+    second-stage ignition, so the second branch is live for the whole first-stage
+    boost -- which is also where dynamic pressure peaks. Modelling thrust as
+    ``(T, 0, 0)`` there leaves 0.42 m/s^2 unaccounted for against a 5.2 m/s^2
+    aerodynamic force (measured, 2 runs), a 7% bias that ``dA`` would absorb and
+    report as aerodynamics.
+
+    One expression covers both branches: CADAC holds ``etax``/``zetx`` at exactly
+    zero whenever TVC is inactive (verified across all four flight phases), and at
+    zero the direction cosines collapse to ``(1, 0, 0)``. No ``mtvc`` flag is needed
+    and none is plotted.
     """
 
     name = "propulsion"
@@ -192,10 +218,19 @@ class PropulsionModule(PhysicsModule):
         thrust = p[:, layout.p("thrust")]
         mass = p[:, layout.p("vmass")].clamp_min(1.0)
 
+        eta = p[:, layout.p("etax")] * DEG
+        zet = p[:, layout.p("zetx")] * DEG
+        # tvc.cpp lines 118-120, exactly. Note |FPB| == thrust for any deflection:
+        # the gimbal redirects thrust, it does not throttle it.
+        fpb = torch.stack([
+            eta.cos() * zet.cos(),
+            eta.cos() * zet.sin(),
+            -eta.sin(),
+        ], dim=1) * (thrust / mass).unsqueeze(1)
+
+        # TBI maps inertial -> body, so its transpose maps body -> inertial.
         tbi = body_to_inertial(p, layout, t)
-        # TBI maps inertial -> body, so its transpose maps body -> inertial. The
-        # body-frame thrust vector is (T, 0, 0), so we need only TBI's first row.
-        c[:, vel] += tbi[:, 0, :] * (thrust / mass).unsqueeze(1)
+        c[:, vel] += torch.bmm(tbi.transpose(1, 2), fpb.unsqueeze(-1)).squeeze(-1)
 
 
 class AerodynamicsModule(PhysicsModule):

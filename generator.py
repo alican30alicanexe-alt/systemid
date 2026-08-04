@@ -121,6 +121,16 @@ DEFAULT_PARAMS: tuple[str, ...] = (
     # body_to_inertial() / inertial_to_geocentric(); omitting them raises KeyError.
     "phibdx", "thtbdx", "psibdx",  # Euler angles, body wrt geodetic - deg
     "lonx", "latx",                # geodetic longitude / latitude   - deg
+    # Thrust vector control nozzle deflection. Load-bearing for the same reason as
+    # the Euler angles: PropulsionModule needs the direction thrust actually points,
+    # and from t=10 s to first-stage burnout `input_insertion.asc` runs `mtvc 2`, so
+    # `forces.cpp` adds the gimballed vector FPB rather than thrust along body x.
+    # Measured at 0.42 m/s^2 during boost, ~7% of the aerodynamic force there --
+    # which, unmodelled, is absorbed into dA as if it were aerodynamics.
+    #
+    # Safe as network inputs: these are angles, not forces. Unlike FSPB they carry
+    # no information about the aerodynamic coefficients the model must identify.
+    "etax", "zetx",                # nozzle pitch / yaw deflection   - deg
 )
 
 #: Truth columns for validating finite differences, as ``state -> CADAC's own
@@ -128,6 +138,22 @@ DEFAULT_PARAMS: tuple[str, ...] = (
 TRUTH_DERIVATIVES: dict[str, str] = {
     "VBII1": "ABII1", "VBII2": "ABII2", "VBII3": "ABII3",
 }
+
+#: CADAC's own non-gravitational specific force, body axes, m/s^2. Stored under the
+#: ``fspb`` key -- deliberately **not** in :data:`DEFAULT_PARAMS`.
+#:
+#: ``newton.cpp`` builds the acceleration as ``~TBI*FSPB + ~TGI*GRAVG``, where
+#: ``FSPB = FAPB/vmass``. ``~TGI*GRAVG`` is ``GravityJ2Module`` and the thrust part
+#: of ``~TBI*FSPB`` is ``PropulsionModule``, so the aerodynamic specific force this
+#: project identifies is exactly ``~TBI*FSPB`` minus the modelled thrust. That makes
+#: ``FSPB`` ground truth for ``dA x + dc``, turning the residual from an argument by
+#: elimination into a measured error.
+#:
+#: It must stay out of the parameter vector. ``forces.cpp`` sets
+#: ``FAPB = pdynmc*refa*(cx, cy, cz)`` before adding thrust, i.e. ``FSPB`` *contains*
+#: the aerodynamic force. Feeding it to the network as an input would let the model
+#: copy the answer instead of identifying it, and the loss would look excellent.
+TRUTH_VARS: tuple[str, ...] = ("FSPB1", "FSPB2", "FSPB3")
 
 #: ``name -> (mean, sigma)`` for a Gaussian dispersion on an ``input.asc`` scalar.
 #: Defaults disperse launch attitude, gross mass and specific impulse -- enough to
@@ -501,12 +527,15 @@ def build_dataset(cfg: GeneratorConfig, plot_file: Path) -> dict[str, np.ndarray
     names, data = parse_plot_file(plot_file)
     index = {name: i for i, name in enumerate(names)}
 
-    missing = [v for v in (*cfg.state_vars, *cfg.param_vars) if v not in index]
+    missing = [
+        v for v in (*cfg.state_vars, *cfg.param_vars, *TRUTH_VARS) if v not in index
+    ]
     if missing:
         raise RuntimeError(f"columns absent from plot1.asc: {missing}")
 
     state_cols = [index[v] for v in cfg.state_vars]
     param_cols = [index[v] for v in cfg.param_vars]
+    truth_cols = [index[v] for v in TRUTH_VARS]
     time_col, thrust_col = index["time"], index["thrust"]
 
     # Optional ground-truth derivative columns, used only to score our differencing.
@@ -516,7 +545,7 @@ def build_dataset(cfg: GeneratorConfig, plot_file: Path) -> dict[str, np.ndarray
         if TRUTH_DERIVATIVES.get(v) in index
     ]
 
-    xs, ps, xdots, run_ids, times = [], [], [], [], []
+    xs, ps, xdots, run_ids, times, fspbs = [], [], [], [], [], []
     n_raw = 0
 
     for run_id, run_data in enumerate(split_runs(data, time_col)):
@@ -525,6 +554,7 @@ def build_dataset(cfg: GeneratorConfig, plot_file: Path) -> dict[str, np.ndarray
         time = run_data[:, time_col]
         x = run_data[:, state_cols]
         p = run_data[:, param_cols]
+        fspb = run_data[:, truth_cols]
 
         xdot = _central_diff(x, time)
         interior = slice(1, len(run_data) - 1)
@@ -539,6 +569,11 @@ def build_dataset(cfg: GeneratorConfig, plot_file: Path) -> dict[str, np.ndarray
         xdots.append(xdot[keep])
         times.append(time[interior][keep])
         run_ids.append(np.full(keep.sum(), run_id))
+        # Same interior slice and staging mask as everything else. FSPB is a truth
+        # column compared row-by-row against a residual built from x and p, so a
+        # different selection here would misalign it by a sample and show up as a
+        # plausible-looking constant offset rather than as an error.
+        fspbs.append(fspb[interior][keep])
 
     if not xs:
         raise RuntimeError("no usable samples -- check ENDTIME and plot_step")
@@ -553,8 +588,10 @@ def build_dataset(cfg: GeneratorConfig, plot_file: Path) -> dict[str, np.ndarray
         "xdot": np.concatenate(xdots),
         "t": np.concatenate(times),
         "run_id": np.concatenate(run_ids).astype(np.int32),
+        "fspb": np.concatenate(fspbs),
         "state_names": np.array(cfg.state_vars),
         "param_names": np.array(cfg.param_vars),
+        "fspb_names": np.array(TRUTH_VARS),
     }
 
     n_kept = len(dataset["x"])
@@ -613,7 +650,7 @@ def generate(cfg: GeneratorConfig, force_rebuild: bool = False) -> Path:
 
 #: Arrays concatenated when merging chunks. Everything else in a chunk file is
 #: metadata that must agree rather than accumulate.
-_STACKED = ("x", "p", "xdot", "t", "run_id")
+_STACKED = ("x", "p", "xdot", "t", "run_id", "fspb")
 
 #: Seed stride between chunks. Wide enough that no two chunks can draw overlapping
 #: dispersion sequences, and stable so a chunk's seed never depends on how many
@@ -721,9 +758,20 @@ def merge_datasets(paths: Sequence[Path], out_path: Path) -> Path:
 
     for path in paths:
         with np.load(path, allow_pickle=True) as chunk:
+            # A chunk written before FSPB was stored has no such key. Say so, rather
+            # than raising a bare KeyError: the cause is always the cache trap below
+            # -- chunk files are keyed only by index, so a schema change does not
+            # invalidate them and they are picked up as if still current.
+            absent = [k for k in _STACKED if k not in chunk]
+            if absent:
+                raise RuntimeError(
+                    f"{path.name} predates the current dataset schema (missing "
+                    f"{absent}). Delete the chunk directory and regenerate; chunks "
+                    "are cached by index alone and do not notice config changes."
+                )
             for key in _STACKED:
                 merged[key].append(chunk[key])
-            for key in ("state_names", "param_names", "dt"):
+            for key in ("state_names", "param_names", "fspb_names", "dt"):
                 if key in meta and not np.array_equal(meta[key], chunk[key]):
                     raise RuntimeError(
                         f"{path.name}: {key} differs from earlier chunks "

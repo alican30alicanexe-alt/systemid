@@ -11,9 +11,9 @@ zero the model *is* the analytical model, exactly.
 Conditioning
 ------------
 A naive ``dA`` is unusable. ``|SBII|`` is ~6.4e6 m while the aerodynamic residual
-is ~0.04 m/s^2, so the entries coupling them are ~1e-8 -- eight orders of magnitude
-below the weight scale an MLP initialises at. The network would have to learn its
-own output scaling before learning any physics.
+has a median of 0.113 m/s^2 over an ascent, so the entries coupling them are ~1e-8
+-- eight orders of magnitude below the weight scale an MLP initialises at. The
+network would have to learn its own output scaling before learning any physics.
 
 So the network predicts a conditioned ``A_tilde`` and the physical matrix is
 recovered by a scaling sandwich::

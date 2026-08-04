@@ -113,9 +113,9 @@ def build_loaders(
     positions in float32 picks up ~10 m/s of quantisation noise -- the failure the
     generator's plot-file precision patch exists to prevent. Nothing in the
     training path re-differences (``xdot`` is precomputed), and float32 relative
-    precision costs ~1e-6 m/s^2 in the gravity term against a ~0.04 m/s^2
-    residual, so casting down here is safe. Pass ``torch.float64`` for analysis
-    that touches the raw magnitudes.
+    precision costs ~1e-6 m/s^2 in the gravity term against a residual whose
+    median is 0.113 m/s^2, so casting down here is safe. Pass ``torch.float64``
+    for analysis that touches the raw magnitudes.
     """
     data = np.load(data_path, allow_pickle=True)
     state_names = list(data["state_names"].tolist())
