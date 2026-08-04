@@ -182,6 +182,14 @@ class DragStructureModule(PhysicsModule):
     remaining offset channel ``dc[1]`` -- and the three-way ambiguity collapses to
     a single free entry, which is then forced to be the drag model.
 
+    Measured, 50 runs, 200 epochs, lambda=0, against the unconstrained model at its
+    best (lambda=0): ``dA[1,1]`` relative error **52.51% -> 0.05%**, and accuracy
+    *improved* -- median acceleration error 0.0068 -> 0.0038 m/s^2 overall and
+    0.0060 -> 0.0034 at |v| > 40. That second half is the informative one. The
+    coefficient being right is forced by the mask; the accuracy gain is not, and it
+    says the two frozen channels were carrying factorisation slack rather than
+    physics. Constraining the model made it fit better.
+
     Note it is *false* under experiment 4, where density varies with height. That
     is the point of experiment 4: the correct SDC form still puts the height
     dependence in ``dA[1,1]``'s coefficient, so the claim survives. If it did not,

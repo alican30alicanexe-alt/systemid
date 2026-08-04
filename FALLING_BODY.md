@@ -275,7 +275,60 @@ established relationship to the true aerodynamics.
 
 Nothing measured on `main` is wrong. The interpretation of one row of it was.
 
-### Experiment 5 — structure instead of penalty (wired, not yet run)
+### Experiment 5 — structure instead of penalty ✅ **measured**
+
+**One structural claim recovers the drag model exactly, and costs nothing. It is not
+a trade of accuracy for readability — accuracy improved 1.8× over the best
+unconstrained model.**
+
+| | λ=0 unstructured | λ=0.1 unstructured | **structured, λ=0** |
+|---|---|---|---|
+| `dA[1,1]` rel error | 52.51% | 51.79% | **0.05%** |
+| force off the drag block | 3.919 | 3.487 | 0.000 |
+| force error, median | 0.0092 | 0.1470 | **0.0040** |
+| accel error, all | 0.0068 | 0.1345 | **0.0038** |
+| accel error, \|v\|>40 | 0.0060 | 0.1502 | **0.0034** |
+
+```
+dA[1,0] * y   (height-shaped)      0.0000   should be 0
+dA[1,1] * v   (drag-shaped)        7.5398   should be everything
+dc[1]         (offset)             0.0000   should be 0
+|true drag|                        7.5428
+
+  |v| bucket        |true dA11|     |error|      rel
+      0-5               0.00688     0.00095    13.8%
+      5-20              0.03855     0.00059     1.5%
+     20-40              0.09543     0.00021     0.2%
+     40-inf             0.16294     0.00007     0.0%
+```
+
+**Read the rows in the right order.** The top two are *forced*: with one channel,
+`dA[1,1] = force/v`, and `0.0000` off-block is definitional, not evidence. The
+bottom three are the measurement, and they are the surprise — the constraint was
+predicted merely to be compatible with the data, and instead it **helps**. Removing
+two of three degrees of freedom leaves the network one smooth scalar to represent
+instead of three competing for the same force. It also stopped at `best epoch 200`,
+still improving when it ran out of epochs, at λ=0 with nothing penalising anything.
+
+The `|v| < 5` bucket keeps 13.8% relative error. That is honest weak determination
+rather than misattribution: the true coefficient there is 0.00688 against a force of
+~0, so `force/v` is nearly 0/0 and no method could do better.
+
+#### What the branch establishes
+
+1. **A magnitude penalty cannot recover the physical factorisation.** Not "does not
+   in practice" — the conditioning sandwich makes every channel equally cheap by
+   construction, and minimum-norm then prefers the spread over the truth by a
+   measured 2.54×.
+2. **A structural claim does, and is free.** 52% → 0.05% on the coefficient, with
+   accuracy improving rather than degrading.
+3. **Therefore interpretability of an SDC matrix comes from the mask, not the
+   regulariser.** `lambda_reg` buys agreement between seeds; `exact_blocks` buys
+   agreement with reality. `main` had the mechanism all along — it was freezing only
+   the kinematic rows, which is a definition, when it could have been carrying
+   physics.
+
+### Experiment 5 as originally wired
 
 If the penalty cannot pick the physical factorisation, the factorisation has to be
 declared. `DragStructureModule` claims `dA[1,0] = 0` — *drag depends on velocity,
@@ -326,6 +379,16 @@ whether the 0.5%-at-max-Q accuracy survives the constraint. If it does, the bloc
 never carrying physics and the 4.4832 m/s² was pure factorisation slack. If accuracy
 degrades, the constraint is false and something genuinely does depend on position —
 which would itself be worth knowing.
+
+At n=2 the answer was better than "survives": accuracy **improved 1.8×**. If that
+transfers, ROCKET6G should get a readable drag model *and* beat its own 79.6 m
+rollout, from a change that adds one `exact_blocks` entry and no parameters.
+
+Concretely, on `main`: give `AerodynamicsModule` an `exact_blocks` returning
+`[(s_slice("VBII"), s_slice("SBII"))]` — aerodynamic force depends on velocity,
+density and attitude, not on inertial position — and set `learn_delta_c=False` if the
+offset also proves unnecessary. Then re-run the max-Q bucket and the rollout. That is
+the whole experiment.
 
 ### Two known weaknesses in the measurement
 

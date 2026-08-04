@@ -107,11 +107,19 @@ Three findings:
 > `fall.py --min-norm` to reproduce it in seconds.
 
 The consequence for `main`: the identifiability sweep is a real gate against
-*inconsistency*, but it cannot certify correctness, and `dA[3:6,0:3]` carrying
-4.4832 m/s² is still unexplained. The route being tested on the branch is structural
-— aerodynamic force depends on velocity, density and attitude, **not on inertial
-position**, so that block is a candidate to freeze via `exact_blocks` rather than to
-penalise.
+*inconsistency*, but it cannot certify correctness.
+
+**What does work is structural, and the branch measured it.** Freezing the offending
+block via `exact_blocks` — rather than penalising it — took the falling body's
+coefficient error from **52.51% to 0.05%**, and *improved* accuracy at the same time
+(median acceleration error 0.0068 → 0.0038 m/s², and 0.0060 → 0.0034 in the strongest
+bucket) at λ=0, with nothing penalising anything. Constraining the model made it fit
+better, because the frozen channels were carrying factorisation slack rather than
+physics.
+
+`lambda_reg` buys agreement between seeds; `exact_blocks` buys agreement with
+reality. This repo has had the mechanism since the start and has been using it only
+for the kinematic rows, which are a definition — when it could be carrying physics.
 
 Two datasets exist locally, both gitignored: `data/smoke.npz` (2 runs) and
 `data/smoke4.npz` (4 runs). Both are too small to train on — 4 runs splits to
@@ -125,9 +133,20 @@ Next actions, in order:
    λ=0.1 moved the drag block from 48.3% to 52.9% of the force while `dA[1,1]` stayed
    ~52% wrong. Running it on ROCKET6G would produce a number with no way to tell
    whether it means anything, which is the exact trap this project exists to avoid.
-2. [FALLING_BODY.md](FALLING_BODY.md), experiment 5 — freeze the block instead of
-   penalising it. If one structural claim recovers the drag model exactly at n=2,
-   the same claim is available on ROCKET6G and is where `main` should resume.
+2. ✅ [FALLING_BODY.md](FALLING_BODY.md), experiment 5 — done, and it worked: one
+   structural claim took the coefficient error from 52.51% to 0.05% while *improving*
+   accuracy 1.8×.
+3. **Freeze `dA[3:6,0:3]` on ROCKET6G.** Give `AerodynamicsModule` an `exact_blocks`
+   returning `[(layout.s_slice("VBII"), layout.s_slice("SBII"))]` — aerodynamic force
+   depends on velocity, density and attitude, **not on inertial position** — and
+   re-run at `lambda_reg = 0`. That drops the free entries from 18 to 9 and removes
+   the block that wrongly carried 4.4832 m/s².
+
+   The matrix is *guaranteed* to look better, so it is not the test. The test is the
+   max-Q bucket and the rollout: at n=2 the constraint improved both, and if that
+   transfers, ROCKET6G gets a readable drag model *and* beats its own 79.6 m rollout
+   from a change that adds no parameters. If accuracy degrades instead, the claim is
+   false and something really does depend on inertial position — also worth knowing.
 
 To regenerate data (only if the schema changes again): run
 [colab_generate_data.ipynb](colab_generate_data.ipynb) and **delete
