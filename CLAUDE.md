@@ -172,6 +172,7 @@ A phone-readable version of this status lives at
 | [identifiability.py](identifiability.py) | Multi-seed sweep: does the recovered matrix mean anything? |
 | [run.py](run.py) | End-to-end entry point. |
 | [colab_train.ipynb](colab_train.ipynb) | Colab training: gate → train → inspect `dA` → rollout → sweep. |
+| [RESUME.md](RESUME.md) | **Start here after a break.** Where the work stopped, what the result was, and the single next action. |
 | [FALLING_BODY.md](FALLING_BODY.md) | Plan and results for the `falling-body` branch: the same identifiability question at n=2, where the true matrix is known in closed form. |
 | [fall.py](fall.py) | **branch only.** Falling body with drag: simulator, two modules, gate, train, sweep. Imports no CADAC. |
 | [colab_fall.ipynb](colab_fall.ipynb) | **branch only.** Colab for `fall.py`. No Drive, no compilation — data generates in the notebook. |
