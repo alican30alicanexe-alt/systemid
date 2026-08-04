@@ -167,18 +167,118 @@ class DragModule(PhysicsModule):
         return
 
 
+class DragStructureModule(PhysicsModule):
+    """Claims ``dA[1,0] = 0``: drag depends on velocity, not on height.
+
+    Contributes no force -- it contributes *knowledge*, which is what
+    ``exact_blocks`` is for. Freezing an entry is a statement that the physics
+    determines it, and "the drag on a body does not depend on how high the body
+    is" qualifies exactly as much as ``dy/dt = v`` does.
+
+    This exists because of what :func:`minimum_norm_split` measures: the L2
+    penalty cannot pick the physical factorisation, and no value of
+    ``lambda_reg`` will make it. Structure can. Enable it together with
+    ``learn_delta_c=False`` -- with row 0 already frozen, that switch removes the
+    remaining offset channel ``dc[1]`` -- and the three-way ambiguity collapses to
+    a single free entry, which is then forced to be the drag model.
+
+    Note it is *false* under experiment 4, where density varies with height. That
+    is the point of experiment 4: the correct SDC form still puts the height
+    dependence in ``dA[1,1]``'s coefficient, so the claim survives. If it did not,
+    freezing this would be the same sin as "correcting" CADAC's J2 sign.
+    """
+
+    name = "drag_structure"
+
+    def contribute(self, x, p, t, layout, A, B, c) -> None:
+        return
+
+    def exact_blocks(self, layout):
+        row, col = layout.s("v"), layout.s("y")
+        return [(slice(row, row + 1), slice(col, col + 1))]
+
+
 MODULES: dict[str, type[PhysicsModule]] = {
     "kinematics": KinematicsModule,
     "gravity": ConstantGravityModule,
     "drag": DragModule,
+    "drag_structure": DragStructureModule,
 }
 
-#: Everything analytical except drag.
-DEFAULT_KNOWN: dict[str, bool] = {"kinematics": True, "gravity": True, "drag": False}
+#: Everything analytical except drag. ``drag_structure`` is off by default so the
+#: unconstrained result stays the baseline the structured one is compared against.
+DEFAULT_KNOWN: dict[str, bool] = {
+    "kinematics": True, "gravity": True, "drag": False, "drag_structure": False,
+}
+
+#: Experiment 5: the same problem with one structural claim added.
+STRUCTURED_KNOWN: dict[str, bool] = DEFAULT_KNOWN | {"drag_structure": True}
 
 
 def make_physics(layout: StateLayout, known: dict[str, bool] | None = None) -> PhysicsModel:
     return PhysicsModel(layout, known=known or DEFAULT_KNOWN, modules=MODULES)
+
+
+def minimum_norm_split(npz_path: str | Path) -> dict[str, float]:
+    """Why ``lambda_reg`` cannot recover the true matrix. Closed form, no training.
+
+    :func:`model.graybox_loss` penalises ``||a_tilde||^2 + ||c_tilde||^2``. On the
+    velocity row the model must satisfy::
+
+        F = r * ( a0 * (y/s0) + a1 * (v/s1) + c )
+
+    with ``r = residual_scale[1]`` and ``s = state_scale``. Writing
+    ``u = (y/s0, v/s1, 1)``, that is ``r * u.w = F``, whose minimum-norm solution is
+    ``w = (F/r) u / ||u||^2`` -- so each channel carries ``F * u_i^2 / ||u||^2``.
+
+    Two consequences, both measured below and neither fixable by tuning:
+
+    - The conditioning sandwich normalises every channel to O(1). That is its job,
+      and it is why ``dA`` is interpretable at all. But it also makes the three
+      channels **equally cheap**, so nothing in the penalty prefers the physical one.
+    - ``||(F/3, F/3, F/3)||^2 < ||(F, 0, 0)||^2``. Minimum-norm therefore *prefers*
+      spreading the force over concentrating it. The regulariser is not failing to
+      pick the truth; it is pushing away from it.
+
+    So raising ``lambda_reg`` makes every seed spread the same way, which reads as
+    "identified" on :mod:`identifiability` and is still wrong. Measured on the
+    50-run set: seeds agree to 2.5% at lambda=0.1 while ``dA[1,1]`` is 51.8% off.
+    """
+    data = np.load(npz_path, allow_pickle=True)
+    x, p = data["x"], data["p"]
+    y, v = x[:, 0], x[:, 1]
+
+    s0 = np.sqrt(np.mean(y ** 2))
+    s1 = np.sqrt(np.mean(v ** 2))
+    force = drag_acceleration(x, p[:, 0])
+    r = np.sqrt(np.mean(force ** 2))
+
+    u = np.stack([y / s0, v / s1, np.ones_like(y)], axis=1)
+    carried = np.abs(force)[:, None] * u ** 2 / (u ** 2).sum(axis=1, keepdims=True)
+
+    med = int(np.argsort(np.abs(force))[len(force) // 2])
+    concentrated = np.mean((force / r / (v / s1)) ** 2)
+    spread = np.mean(((force / r)[:, None] * u / (u ** 2).sum(axis=1, keepdims=True)) ** 2) * 3
+
+    print(f"state_scale = [{s0:.3f}, {s1:.3f}]   residual_scale[1] = {r:.3f}")
+    print("\ncost of carrying the whole force through one channel alone, median sample")
+    print("  (equal means the penalty has no preference at all)")
+    for name, col in zip(["dA[1,0] via y", "dA[1,1] via v", "dc[1]        "], range(3)):
+        print(f"  {name}   {abs(force[med] / r / u[med, col]):.4f}")
+
+    print("\nminimum-norm split of the true force (mean |.|, m/s^2)")
+    for name, col in zip(["dA[1,0] * y", "dA[1,1] * v", "dc[1]      "], range(3)):
+        print(f"  {name}   {carried[:, col].mean():7.4f}")
+    print(f"  {'|true drag|':<12}  {np.abs(force).mean():7.4f}")
+
+    print(f"\n  ||w||^2, all force in the true block : {concentrated:.4f}")
+    print(f"  ||w||^2, minimum-norm spread         : {spread:.4f}")
+    print(f"  the penalty prefers the wrong answer by {concentrated / spread:.2f}x")
+    return {
+        "concentrated_cost": float(concentrated),
+        "spread_cost": float(spread),
+        "preference": float(concentrated / spread),
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -397,11 +497,15 @@ def train(args: argparse.Namespace) -> int:
         args.data, batch_size=args.batch_size, seed=args.seed
     )
     layout = StateLayout(test.state_names, test.param_names)
-    physics = make_physics(layout)
+    physics = make_physics(layout, STRUCTURED_KNOWN if args.structured else None)
     vel = slice(layout.s("v"), layout.s("v") + 1)
+    print(physics, "| free dA entries:", int(physics.free_mask().sum()))
 
     model = GrayBoxSSM.from_data(
-        train_loader, physics, n_param=len(test.param_names), hidden=args.hidden
+        train_loader, physics, n_param=len(test.param_names), hidden=args.hidden,
+        # With row 0 already frozen, this removes dc[1] -- the last channel that
+        # can carry force without going through the drag entry.
+        learn_delta_c=not args.structured,
     )
     print(f"[model] {sum(q.numel() for q in model.parameters())} parameters")
 
@@ -447,6 +551,12 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--generate", action="store_true")
     mode.add_argument("--train", action="store_true")
     mode.add_argument("--sweep", action="store_true")
+    mode.add_argument("--min-norm", action="store_true",
+                      help="print why lambda_reg cannot recover the matrix")
+
+    parser.add_argument("--structured", action="store_true",
+                        help="experiment 5: freeze dA[1,0] and dc[1], leaving drag "
+                             "as the only channel that can carry the force")
 
     parser.add_argument("--data", type=Path, default=Path("data/fall.npz"))
     parser.add_argument("-n", "--runs", type=int, default=50)
@@ -472,6 +582,9 @@ def main(argv: list[str] | None = None) -> int:
         generate(args.runs, args.out, seed=args.seed)
         print()
         residual_report(args.out)
+        return 0
+    if args.min_norm:
+        minimum_norm_split(args.data)
         return 0
     if args.sweep:
         return sweep(args)

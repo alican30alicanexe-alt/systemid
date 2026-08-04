@@ -202,7 +202,110 @@ the MSE. So the "half the reported MSE is a constant" problem in CLAUDE.md's ope
 list does not exist here — `val_mse` is readable (0.00000 at best epoch). It is
 still blind to the 52% misattribution above, which is the point.
 
-Experiment 3 (the λ sweep) is next and belongs on Colab, not the Pi.
+### Experiment 3, measured — **λ does not fix it, and provably cannot**
+
+This is the finding the branch was built to get, and it goes against what `main`
+concluded.
+
+Sweep, 3 seeds × 5 λ, 40 epochs:
+
+| λ | pred disagr | matrix disagr | err maxQ | val mse |
+|---|---|---|---|---|
+| 0 | 0.0030 | 0.1893 | 0.0452 | 0.00004 |
+| 1e-3 | 0.0030 | 0.1133 | 0.0474 | 0.00004 |
+| 1e-2 | 0.0033 | **0.0289** | 0.0468 | 0.00004 |
+| 1e-1 | 0.0034 | **0.0249** | 0.1476 | 0.00017 |
+| 1 | 0.0192 | 0.0491 | 1.3960 | 0.01319 |
+
+That reproduces `main` exactly: a knee at 1e-2 where matrix disagreement collapses
+6.5× at no accuracy cost. On `main` this was read as "λ=1e-1 is where the matrix
+becomes trustworthy."
+
+It isn't. Training at λ=0.1 for 200 epochs:
+
+```
+dA[1,0] * y   (height-shaped)      2.0703   should be 0
+dA[1,1] * v   (drag-shaped)        3.9214   should be everything
+dc[1]         (offset)             1.4165   should be 0
+dA[1,1] error median            7.380e-02 1/s (51.79% of truth)
+```
+
+**Seeds agree to 2.5%. The truth disagrees by 51.8%.** The drag block carries 52.9%
+of the force against 48.3% at λ=0 — λ bought 4.6 points of attribution for 10×
+worse accuracy (rollout 0.639 m → 6.162 m). It did not move the force into the
+right block; it made every seed put it in the *same wrong* place.
+
+#### Why — closed form, no training (`fall.py --min-norm`)
+
+The penalty is `‖a_tilde‖² + ‖c_tilde‖²`, and on the velocity row the model must
+satisfy `F = r·(a0·(y/s0) + a1·(v/s1) + c)`. Measured on the 50-run set:
+
+```
+cost of carrying the whole force through one channel alone, median sample
+  dA[1,0] via y   0.9142
+  dA[1,1] via v   0.8777
+  dc[1]           1.1386
+
+  ||w||^2, all force in the true block : 0.9366
+  ||w||^2, minimum-norm spread         : 0.3683
+  the penalty prefers the wrong answer by 2.54x
+```
+
+Two facts, neither tunable:
+
+- **The conditioning sandwich makes every channel equally cheap.** That is its job
+  — normalising each to O(1) is what makes `dA` interpretable at all — but it means
+  nothing in the penalty prefers the physical channel. 0.914 / 0.878 / 1.139.
+- **Minimum-norm prefers spreading.** `‖(F/3,F/3,F/3)‖² < ‖(F,0,0)‖²`, so the
+  penalty scores the true concentrated answer 2.54× *worse* than the spread.
+
+λ therefore does not fail to find the truth. It points away from it. And the
+predicted min-norm split (1.54 / 2.99 / 2.60) has the same character as the
+measured one (2.07 / 3.92 / 1.42): force in all three channels, drag largest but
+nowhere near all.
+
+#### What this costs `main`
+
+`main`'s identifiability sweep is a real gate and it measures a real thing — but
+it measures **consistency, not correctness**, and those come apart exactly where it
+matters. CLAUDE.md already carried the caveat ("low matrix disagreement proves the
+seeds agree with each other, not with the truth"). That caveat is now the headline:
+the recommended λ=0.1 on ROCKET6G buys agreement between seeds and has no
+established relationship to the true aerodynamics.
+
+Nothing measured on `main` is wrong. The interpretation of one row of it was.
+
+### Experiment 5 — structure instead of penalty (wired, not yet run)
+
+If the penalty cannot pick the physical factorisation, the factorisation has to be
+declared. `DragStructureModule` claims `dA[1,0] = 0` — *drag depends on velocity,
+not on height* — through the same `exact_blocks` mechanism that freezes `dy/dt = v`.
+Freezing an entry is a statement that physics determines it, and this claim
+qualifies as much as the kinematic one. `learn_delta_c=False` removes `dc[1]`, the
+last channel that can carry force without going through the drag entry.
+
+That leaves **one free entry against one equation**, verified:
+
+```
+default    | free_mask = [[0, 0], [1, 1]] | free entries 2  (+ dc[1])
+structured | free_mask = [[0, 0], [0, 1]] | free entries 1
+```
+
+Exactly determined. If the model fits at all, `dA[1,1]` *must* be `-(k/m)|v|`, and λ
+should become nearly irrelevant — which is the test.
+
+```bash
+python3 fall.py --train --data data/fall.npz --structured --lambda-reg 0.0
+```
+
+Section 10 of [colab_fall.ipynb](colab_fall.ipynb) runs it and prints the structured
+and unstructured matrices side by side.
+
+**The claim this branch is heading toward:** interpretability of an SDC matrix comes
+from the mask, not the regulariser. On ROCKET6G the analogue is available and true —
+aerodynamic force depends on velocity, density and attitude, not on inertial
+position — so `dA[3:6,0:3]`, the block that wrongly carried 4.4832 m/s², is exactly
+the block that should have been frozen.
 
 ---
 

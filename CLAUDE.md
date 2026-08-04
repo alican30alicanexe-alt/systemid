@@ -83,12 +83,35 @@ Three findings:
   while matrix disagreement moved 8×. Tuning λ on validation loss would conclude it
   does not matter. Only a multi-seed comparison sees it.
 
-`λ = 1e-2` is free; `λ = 1e-1` is where the matrix becomes trustworthy, for 16%
-accuracy on a model already at the integrator floor.
+`λ = 1e-2` is free; `λ = 1e-1` buys the largest collapse in seed disagreement, for
+16% accuracy on a model already at the integrator floor.
 
-⚠️ Low matrix disagreement proves the seeds agree **with each other**, not with the
-truth. CADAC's aerodynamics have no closed-form `A` to check against. That gap is
-what [FALLING_BODY.md](FALLING_BODY.md) exists to close.
+> ⚠️ **This section used to say λ=1e-1 is "where the matrix becomes trustworthy".
+> That was wrong, and the `falling-body` branch measured it.**
+>
+> Low matrix disagreement proves the seeds agree **with each other**, and nothing
+> more. On the falling body, where the true matrix *is* known in closed form, λ=0.1
+> gives seeds that agree to 2.5% and a `dA[1,1]` that is **51.8% wrong** — barely
+> better than the 52.5% at λ=0, for 10× worse accuracy.
+>
+> It is not bad luck. The penalty is `‖a_tilde‖² + ‖c_tilde‖²`, and the conditioning
+> sandwich normalises every channel to O(1) — which is what makes `dA` readable at
+> all, and also what makes every channel equally cheap. Since
+> `‖(F/3,F/3,F/3)‖² < ‖(F,0,0)‖²`, minimum-norm **prefers spreading the force** over
+> concentrating it, by a measured 2.54×. λ does not fail to find the physical
+> factorisation; it points away from it, and raising λ only makes every seed miss
+> the same way.
+>
+> Every number measured on `main` stands. The interpretation of this one row did
+> not. See [FALLING_BODY.md](FALLING_BODY.md) for the closed-form derivation and
+> `fall.py --min-norm` to reproduce it in seconds.
+
+The consequence for `main`: the identifiability sweep is a real gate against
+*inconsistency*, but it cannot certify correctness, and `dA[3:6,0:3]` carrying
+4.4832 m/s² is still unexplained. The route being tested on the branch is structural
+— aerodynamic force depends on velocity, density and attitude, **not on inertial
+position**, so that block is a candidate to freeze via `exact_blocks` rather than to
+penalise.
 
 Two datasets exist locally, both gitignored: `data/smoke.npz` (2 runs) and
 `data/smoke4.npz` (4 runs). Both are too small to train on — 4 runs splits to
@@ -96,12 +119,15 @@ Two datasets exist locally, both gitignored: `data/smoke.npz` (2 runs) and
 
 Next actions, in order:
 
-1. **One 100-epoch run at `lambda_reg = 0.1`** on the full 50-run dataset, then read
-   section 9 of the training notebook. The sweep predicts the force moves into the
-   velocity block; that run is the difference between predicting a readable drag
-   model and having one. This is the only thing still open on `main`.
-2. Then [FALLING_BODY.md](FALLING_BODY.md) — the same investigation at 3 unknowns
-   instead of 21, where the true matrix is known in closed form.
+1. ~~One 100-epoch run at `lambda_reg = 0.1`~~ — **no longer worth a Colab session.**
+   The sweep predicted the force would move into the velocity block. On the falling
+   body, where the same prediction can be checked against a closed form, it does not:
+   λ=0.1 moved the drag block from 48.3% to 52.9% of the force while `dA[1,1]` stayed
+   ~52% wrong. Running it on ROCKET6G would produce a number with no way to tell
+   whether it means anything, which is the exact trap this project exists to avoid.
+2. [FALLING_BODY.md](FALLING_BODY.md), experiment 5 — freeze the block instead of
+   penalising it. If one structural claim recovers the drag model exactly at n=2,
+   the same claim is available on ROCKET6G and is where `main` should resume.
 
 To regenerate data (only if the schema changes again): run
 [colab_generate_data.ipynb](colab_generate_data.ipynb) and **delete
