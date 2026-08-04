@@ -24,26 +24,32 @@ class TrajectoryDataset(Dataset):
     t: torch.Tensor
     xdot: torch.Tensor
     run_id: torch.Tensor
+    state_names: list[str]
+    param_names: list[str]
     #: CADAC's own non-gravitational specific force, body axes, m/s^2. Ground truth
     #: for the identified aerodynamics via ``physics.aerodynamic_truth``; carried
     #: through so analysis can score ``dA x + dc`` against it. Never an input to the
     #: model -- it contains the force the model is supposed to identify.
-    fspb: torch.Tensor
-    state_names: list[str]
-    param_names: list[str]
+    #:
+    #: Optional, because it is CADAC's name for a CADAC quantity. A domain whose
+    #: truth is known in closed form has no simulator to read it from and leaves
+    #: this ``None``; everything except the truth-attribution analysis works without it.
+    fspb: torch.Tensor | None = None
 
     def __len__(self) -> int:
         return len(self.x)
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
-        return {
+        item = {
             "x": self.x[index],
             "p": self.p[index],
             "t": self.t[index],
             "xdot": self.xdot[index],
             "run_id": self.run_id[index],
-            "fspb": self.fspb[index],
         }
+        if self.fspb is not None:
+            item["fspb"] = self.fspb[index]
+        return item
 
     def trajectories(self) -> Iterator[dict[str, torch.Tensor]]:
         """Yield each trajectory as one contiguous dict of tensors."""
@@ -51,14 +57,16 @@ class TrajectoryDataset(Dataset):
         for rid in unique:
             mask = self.run_id == rid
             idx = mask.nonzero(as_tuple=False).flatten()
-            yield {
+            traj = {
                 "x": self.x[idx],
                 "p": self.p[idx],
                 "t": self.t[idx],
                 "xdot": self.xdot[idx],
                 "run_id": torch.full((len(idx),), rid, dtype=self.run_id.dtype),
-                "fspb": self.fspb[idx],
             }
+            if self.fspb is not None:
+                traj["fspb"] = self.fspb[idx]
+            yield traj
 
 
 def _split_run_ids(
@@ -129,13 +137,20 @@ def build_loaders(
     state_names = list(data["state_names"].tolist())
     param_names = list(data["param_names"].tolist())
 
-    if "fspb" not in data:
+    # A CADAC dataset without 'fspb' predates the truth column and is a real
+    # failure -- the stale-clone trap in CLAUDE.md produced exactly that, and it
+    # cost a full 50-run generation. Datasets from other domains never had one, so
+    # the check keys off the state names rather than rejecting everything.
+    has_fspb = "fspb" in data
+    if not has_fspb and any(n.startswith("SBII") for n in state_names):
         raise KeyError(
             f"{data_path} has no 'fspb' array -- it predates the truth column. "
             "Delete the chunk directory and regenerate; see the chunk-cache trap "
             "in CLAUDE.md."
         )
-    raw = {k: data[k] for k in ("x", "p", "t", "xdot", "run_id", "fspb")}
+
+    keys = ("x", "p", "t", "xdot", "run_id") + (("fspb",) if has_fspb else ())
+    raw = {k: data[k] for k in keys}
     train_ids, val_ids, test_ids = _split_run_ids(
         raw["run_id"], seed, train_fraction, val_fraction
     )
@@ -148,9 +163,9 @@ def build_loaders(
             t=torch.tensor(part["t"], dtype=dtype),
             xdot=torch.tensor(part["xdot"], dtype=dtype),
             run_id=torch.tensor(part["run_id"], dtype=torch.long),
-            fspb=torch.tensor(part["fspb"], dtype=dtype),
             state_names=state_names,
             param_names=param_names,
+            fspb=torch.tensor(part["fspb"], dtype=dtype) if has_fspb else None,
         )
 
     train_dataset, val_dataset, test_dataset = map(make, (train_ids, val_ids, test_ids))

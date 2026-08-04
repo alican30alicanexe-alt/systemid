@@ -102,11 +102,12 @@ def rollout_floor(traj: dict[str, Tensor]) -> Tensor:
 
 
 def evaluate_trajectory(
-    traj: dict[str, Tensor], model: GrayBoxSSM, physics: PhysicsModel
+    traj: dict[str, Tensor], model: GrayBoxSSM, physics: PhysicsModel,
+    truth_name: str = "CADAC",
 ) -> tuple[Rollout, list[Rollout]]:
     """Returns ``(truth, [floor, analytical, gray-box])`` for one run."""
     t = traj["t"].numpy()
-    truth = Rollout("CADAC", t, traj["x"].numpy())
+    truth = Rollout(truth_name, t, traj["x"].numpy())
     return truth, [
         Rollout("Euler floor", t, rollout_floor(traj).numpy()),
         Rollout("analytical", t, rollout_analytical(physics, traj).numpy()),
@@ -144,8 +145,18 @@ def plot_evaluation(
     rollouts: Sequence[Rollout],
     history: dict | None = None,
     out_path: Path = Path("figures/evaluation.png"),
+    n_pos: int = 3,
+    pos_label: str = "geocentric radius (km)",
+    pos_scale: float = 1e3,
 ) -> Path:
-    """Six-panel summary: position, velocity, errors, and loss history."""
+    """Six-panel summary: position, velocity, errors, and loss history.
+
+    ``n_pos`` is the width of the position block; the velocity block is assumed to
+    follow it and to be the same width. The defaults describe CADAC's 6-state
+    layout -- ``pos_label``/``pos_scale`` exist because an axis labelled
+    "geocentric radius (km)" is wrong, not merely unhelpful, for a body falling
+    through a few hundred metres.
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -153,50 +164,51 @@ def plot_evaluation(
     fig, axes = plt.subplots(2, 3, figsize=(18, 9))
     elapsed = truth.t - truth.t[0]
     colors = {"Euler floor": "0.55", "analytical": "tab:orange", "gray-box": "tab:blue"}
-    radius = lambda x: np.linalg.norm(x[:, :3], axis=1) / 1e3
-    speed = lambda x: np.linalg.norm(x[:, 3:6], axis=1)
+    pos, vel = slice(0, n_pos), slice(n_pos, 2 * n_pos)
+    radius = lambda x: np.linalg.norm(x[:, pos], axis=1) / pos_scale
+    speed = lambda x: np.linalg.norm(x[:, vel], axis=1)
 
     ax = axes[0, 0]
-    ax.plot(elapsed, radius(truth.x), "k-", lw=2.5, label="CADAC", zorder=5)
+    ax.plot(elapsed, radius(truth.x), "k-", lw=2.5, label=truth.name, zorder=5)
     for r in rollouts:
         ax.plot(elapsed, radius(r.x), lw=1.4, color=colors.get(r.name), label=r.name)
-    ax.set_ylabel("geocentric radius (km)")
+    ax.set_ylabel(pos_label)
     ax.set_title("Position")
     ax.legend()
 
     ax = axes[0, 1]
-    ax.plot(elapsed, speed(truth.x), "k-", lw=2.5, label="CADAC", zorder=5)
+    ax.plot(elapsed, speed(truth.x), "k-", lw=2.5, label=truth.name, zorder=5)
     for r in rollouts:
         ax.plot(elapsed, speed(r.x), lw=1.4, color=colors.get(r.name), label=r.name)
-    ax.set_ylabel("inertial speed (m/s)")
+    ax.set_ylabel("speed (m/s)")
     ax.set_title("Velocity")
 
     ax = axes[0, 2]
     for r in rollouts:
         ax.semilogy(
-            elapsed, np.linalg.norm(r.x[:, :3] - truth.x[:, :3], axis=1) + 1e-9,
+            elapsed, np.linalg.norm(r.x[:, pos] - truth.x[:, pos], axis=1) + 1e-9,
             lw=1.4, color=colors.get(r.name), label=r.name,
         )
     ax.set_ylabel("|position error| (m)")
-    ax.set_title("Position error vs CADAC")
+    ax.set_title(f"Position error vs {truth.name}")
     ax.legend()
 
     ax = axes[1, 0]
     for r in rollouts:
         ax.semilogy(
-            elapsed, np.linalg.norm(r.x[:, 3:6] - truth.x[:, 3:6], axis=1) + 1e-9,
+            elapsed, np.linalg.norm(r.x[:, vel] - truth.x[:, vel], axis=1) + 1e-9,
             lw=1.4, color=colors.get(r.name), label=r.name,
         )
     ax.set_ylabel("|velocity error| (m/s)")
-    ax.set_title("Velocity error vs CADAC")
+    ax.set_title(f"Velocity error vs {truth.name}")
 
     ax = axes[1, 1]
     for r in rollouts:
         if r.name == "Euler floor":
             continue
         ratio = (
-            np.linalg.norm(r.x[:, :3] - truth.x[:, :3], axis=1)
-            / np.maximum(np.linalg.norm(rollouts[0].x[:, :3] - truth.x[:, :3], axis=1), 1e-9)
+            np.linalg.norm(r.x[:, pos] - truth.x[:, pos], axis=1)
+            / np.maximum(np.linalg.norm(rollouts[0].x[:, pos] - truth.x[:, pos], axis=1), 1e-9)
         )
         ax.semilogy(elapsed, ratio, lw=1.4, color=colors.get(r.name), label=r.name)
     ax.axhline(1.0, color="0.55", ls="--", label="floor")
@@ -233,8 +245,15 @@ def evaluate(
     physics: PhysicsModel,
     history_path: Path | None = None,
     fig_dir: Path = Path("figures"),
+    n_pos: int = 3,
+    truth_name: str = "CADAC",
+    **plot_kwargs,
 ) -> dict[str, dict[str, float]]:
-    """Roll out every test trajectory, print horizon tables, plot the first."""
+    """Roll out every test trajectory, print horizon tables, plot the first.
+
+    ``n_pos`` and ``plot_kwargs`` describe the state layout for anything other than
+    CADAC's 6-state one; see :func:`plot_evaluation`.
+    """
     history = (
         json.loads(Path(history_path).read_text())
         if history_path and Path(history_path).exists()
@@ -243,15 +262,18 @@ def evaluate(
 
     aggregate: dict[str, list[dict[str, float]]] = {}
     for i, traj in enumerate(test.trajectories()):
-        truth, rollouts = evaluate_trajectory(traj, model, physics)
-        table = horizon_table(truth, rollouts)
+        truth, rollouts = evaluate_trajectory(traj, model, physics, truth_name)
+        table = horizon_table(truth, rollouts, n_pos=n_pos)
         print(f"\n=== test run {int(traj['run_id'][0])} "
               f"({len(truth.t)} steps, {truth.t[-1] - truth.t[0]:.1f} s) ===")
         print_horizon_table(table)
         for name, row in table.items():
             aggregate.setdefault(name, []).append(row)
         if i == 0:
-            plot_evaluation(truth, rollouts, history, Path(fig_dir) / "evaluation.png")
+            plot_evaluation(
+                truth, rollouts, history, Path(fig_dir) / "evaluation.png",
+                n_pos=n_pos, **plot_kwargs,
+            )
 
     # Intersect rather than assume rows[0]'s keys cover every run: horizon_table
     # drops a horizon holding fewer than two samples, so a run short enough to

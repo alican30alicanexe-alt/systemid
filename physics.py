@@ -396,17 +396,27 @@ class PhysicsModel:
         layout: StateLayout,
         known: Mapping[str, bool] | None = None,
         n_control: int = 0,
+        modules: Mapping[str, type[PhysicsModule]] | None = None,
     ) -> None:
         self.layout = layout
         self.n_control = n_control
-        self.known = dict(DEFAULT_KNOWN if known is None else known)
+        # A domain other than ROCKET6G supplies its own registry; everything below
+        # this line is name-based and dimension-free, so nothing else needs to know.
+        self.registry = dict(MODULES if modules is None else modules)
 
-        unknown_names = set(self.known) - set(MODULES)
+        if known is None:
+            # DEFAULT_KNOWN names CADAC's subsystems, so it is only a sensible
+            # default for CADAC's registry. For any other one, start with every
+            # module analytical and let the caller switch off what it wants learned.
+            known = DEFAULT_KNOWN if modules is None else {n: True for n in self.registry}
+        self.known = dict(known)
+
+        unknown_names = set(self.known) - set(self.registry)
         if unknown_names:
             raise KeyError(f"no such physics module: {sorted(unknown_names)}")
 
         self.modules = [
-            MODULES[name]() for name, enabled in self.known.items() if enabled
+            self.registry[name]() for name, enabled in self.known.items() if enabled
         ]
 
     def __repr__(self) -> str:

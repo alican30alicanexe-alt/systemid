@@ -41,7 +41,7 @@ from torch import Tensor
 from dataset import build_loaders
 from model import GrayBoxSSM, graybox_loss
 from physics import PhysicsModel, StateLayout
-from trainer import TrainConfig, Trainer
+from trainer import Q_BUCKETS, TrainConfig, Trainer
 
 
 @dataclass
@@ -81,10 +81,26 @@ def _relative_spread(values: list[Tensor]) -> float:
 def run_sweep(
     data: Path, lambdas: list[float], seeds: list[int],
     epochs: int, workdir: Path,
+    q_name: str = "pdynmc",
+    q_threshold: float = 1e4,
+    vel_slice: slice | None = None,
+    buckets: tuple[float, ...] = Q_BUCKETS,
+    modules: dict[str, type] | None = None,
+    known: dict[str, bool] | None = None,
 ) -> list[SweepResult]:
+    """Train ``seeds`` models at each lambda and compare what they recovered.
+
+    Everything from ``q_name`` onwards describes the domain, and every default
+    reproduces ROCKET6G. ``q_name``/``q_threshold`` name the parameter separating
+    the regime where the unknown subsystem is strong (dynamic pressure above
+    10 kPa) from the near-vacuum where there is nothing to identify; ``vel_slice``
+    is the block of ``xdot`` carrying an acceleration.
+    """
     train_loader, val_loader, test, _ = build_loaders(data, batch_size=2048, seed=0)
     layout = StateLayout(test.state_names, test.param_names)
-    q_index = layout.p("pdynmc")
+    q_index = layout.p(q_name)
+    if vel_slice is None:
+        vel_slice = layout.s_slice("VBII")
 
     # A single fixed probe set, so every model is interrogated at identical points.
     probe_x, probe_p = test.x[:4096], test.p[:4096]
@@ -96,7 +112,7 @@ def run_sweep(
 
         for seed in seeds:
             torch.manual_seed(seed)
-            physics = PhysicsModel(layout)
+            physics = PhysicsModel(layout, known=known, modules=modules)
             model = GrayBoxSSM(physics, n_param=len(test.param_names))
             model.fit_scalers(train_loader)
 
@@ -104,7 +120,8 @@ def run_sweep(
                 epochs=epochs, lambda_reg=lam, patience=epochs,
                 ckpt_dir=workdir, run_name=f"lam{lam:g}_seed{seed}", log_every=10**9,
             )
-            trainer = Trainer(model, cfg, q_index=q_index)
+            trainer = Trainer(model, cfg, q_index=q_index, vel_slice=vel_slice,
+                              buckets=buckets)
             history = trainer.fit(train_loader, val_loader)
 
             a_tilde, correction = probe(model, probe_x, probe_p)
@@ -114,10 +131,10 @@ def run_sweep(
 
             with torch.no_grad():
                 xdot, _ = model(test.x, test.p, test.t)
-            errors.append((xdot - test.xdot)[:, layout.s_slice("VBII")].norm(dim=1))
+            errors.append((xdot - test.xdot)[:, vel_slice].norm(dim=1))
 
         error = torch.stack(errors).median(dim=0).values
-        maxq = test.p[:, q_index] >= 1e4
+        maxq = test.p[:, q_index] >= q_threshold
         results.append(SweepResult(
             lambda_reg=lam,
             pred_disagreement=_relative_spread(corrections),

@@ -80,11 +80,21 @@ class Trainer:
 
     def __init__(
         self, model: GrayBoxSSM, config: TrainConfig | None = None,
-        q_index: int | None = None,
+        q_index: int | None = None, vel_slice: slice | None = None,
+        buckets: tuple[float, ...] = Q_BUCKETS,
     ) -> None:
         self.model = model
         self.cfg = config or TrainConfig()
         self.q_index = q_index
+        # Edges of the regime variable at p[:, q_index]. The default is dynamic
+        # pressure in Pa; a domain whose signal is graded by something else must
+        # say so, or every sample lands in one bucket and the report says nothing.
+        self.buckets = buckets
+        # Which rows of xdot carry an acceleration. CADAC's are VBII1..3; a domain
+        # with a different state must say so, since the name lookup would fail.
+        self.vel_slice = (
+            model.layout.s_slice("VBII") if vel_slice is None else vel_slice
+        )
         self.device = torch.device(self.cfg.device)
         self.model.to(self.device)
 
@@ -144,7 +154,7 @@ class Trainer:
         """
         self.model.eval()
         errors, qs = [], []
-        vel = self.model.layout.s_slice("VBII")
+        vel = self.vel_slice
         for batch in loader:
             batch = self._to_device(batch)
             xdot, _ = self.model(batch["x"], batch["p"], batch["t"])
@@ -158,7 +168,7 @@ class Trainer:
             return out
 
         q = torch.cat(qs)
-        for lo, hi in zip(Q_BUCKETS[:-1], Q_BUCKETS[1:]):
+        for lo, hi in zip(self.buckets[:-1], self.buckets[1:]):
             sel = (q >= lo) & (q < hi)
             if sel.sum() > 10:
                 out[f"median_q{lo:g}_{hi:g}"] = error[sel].median().item()
