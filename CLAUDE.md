@@ -159,6 +159,24 @@ copies of the booster — visible only as vehicle mass increasing after staging.
 `write_input` now prints the skipped occurrences. Dispersing an upper stage
 would require stage-scoped keys, which are not implemented.
 
+### Colab keeps a stale clone
+
+Cell 4 of both notebooks used to clone only `if not (CODE/'*.py').exists()`. A
+runtime that had cloned earlier — in a previous session, or before a push — kept
+running old code while the notebook itself was current. Nothing said so: the cell
+*printed* `DEFAULT_PARAMS` and no one compared it against what the code expected.
+
+That produced a complete 50-run, 948450-sample dataset against the pre-`FSPB`
+schema, which only surfaced at the validation cell after generation had finished.
+The tell was `params:` listing 14 names with no `etax`/`zetx`.
+
+Both notebooks now `fetch` + `reset --hard` unconditionally, purge the affected
+entries from `sys.modules` (a re-run otherwise keeps the stale module objects and
+the refresh achieves nothing), print the commit, and **assert the schema in cell 4**.
+The clone costs seconds; the generation it protects costs hours.
+
+The general rule: check the schema at the point of import, not at the point of use.
+
 ### The chunk cache is keyed only by index
 
 `generate_chunked` skips any `chunk_NNN.npz` that already exists, and
